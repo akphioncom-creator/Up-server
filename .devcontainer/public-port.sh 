@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# পোর্ট পাবলিক করার স্ক্রিপ্ট: কোডস্পেসের ৩০০০ পোর্টকে Public করে দেয়
+PORT="${PORT:-3000}"
+
+if [ -z "$CODESPACE_NAME" ]; then
+  echo "এটি কোডস্পেস নয়, তাই পোর্ট পাবলিক করার দরকার নেই।"
+  exit 0
+fi
+
+# GH_PAT নামের Codespaces secret থাকলে সেটা ব্যবহার হয় (codespace অনুমতিসহ টোকেন)
+# না থাকলে কোডস্পেসের নিজস্ব টোকেন দিয়ে চেষ্টা হয়
+if [ -n "$GH_PAT" ]; then
+  export GH_TOKEN="$GH_PAT"
+fi
+
+for i in 1 2 3 4 5; do
+  if gh codespace ports visibility "$PORT:public" -c "$CODESPACE_NAME" >/dev/null 2>&1; then
+    echo "পোর্ট $PORT এখন পাবলিক: https://$CODESPACE_NAME-$PORT.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}"
+    exit 0
+  fi
+  sleep 3
+done
+
+echo "স্বয়ংক্রিয়ভাবে পোর্ট পাবলিক করা যায়নি।"
+echo "কারণ: টোকেনের অনুমতি নেই, অথবা অর্গানাইজেশন পাবলিক পোর্ট বন্ধ রেখেছে।"
+echo "সমাধান: নিচের 'Ports' ট্যাবে $PORT পোর্টে ডান ক্লিক করে Port Visibility > Public দিন।"
+exit 0
