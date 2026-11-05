@@ -1,0 +1,19 @@
+{
+  "name": "Smart Card Server",
+
+  // কোডস্পেস চালু হলে একবার প্যাকেজ ইনস্টল হবে
+  "postCreateCommand": "npm install",
+
+  // ৩০০০ পোর্ট নিজে থেকে ফরওয়ার্ড হবে
+  "forwardPorts": [3000],
+  "portsAttributes": {
+    "3000": {
+      "label": "Smart Card API",
+      "onAutoForward": "notify"
+    }
+  },
+
+  // প্রতিবার কোডস্পেসে ঢুকলে পোর্ট ৩০০০ পাবলিক করার চেষ্টা হবে
+  // (devcontainer.json এ সরাসরি "public" লেখা যায় না, তাই স্ক্রিপ্ট দিয়ে করা হয়)
+  "postAttachCommand": "bash .devcontainer/public-port.sh"
+}
