@@ -45,7 +45,8 @@ router.post('/login', loginLimiter, (req, res) => {
 // ---------- অ্যাপের পাসওয়ার্ড-লগইন ----------
 // অ্যাপ শুধু পাসওয়ার্ড পাঠায়। সঠিক পাসওয়ার্ড .env ফাইলের APP_PASSWORD এ রাখতে হয়।
 // কার্ডের created_by ঘরের জন্য একটি আসল ইউজার লাগে, তাই 'app-user' নামে একটি ইউজার নিজে থেকে তৈরি হয়।
-// ভূমিকা (role) .env এর APP_ROLE থেকে আসে (admin অথবা operator; না দিলে operator)। কার্ড মুছতে admin লাগে।
+// অ্যাপে শুধু পাসওয়ার্ড জানা লোকই ঢুকতে পারে, তাই যে ঢুকবে সে পূর্ণ অনুমতি (admin) পাবে:
+// কার্ড মুছতে ও পারসন লিস্টের রিস্টার্ট করতে আলাদা কোনো অ্যাডমিন লাগে না।
 const appLoginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -72,7 +73,7 @@ router.post('/app-login', appLoginLimiter, (req, res) => {
     return res.status(401).json({ error: 'পাসওয়ার্ড ভুল।' });
   }
 
-  const role = process.env.APP_ROLE === 'admin' ? 'admin' : 'operator';
+  const role = 'admin';
   const username = 'app-user';
 
   let user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
