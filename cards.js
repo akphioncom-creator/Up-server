@@ -14,6 +14,16 @@ const OCCUPATION_OPTIONS = ['কৃষক', 'শ্রমিক', 'ব্যব�
 const SOCIAL_STATUS_OPTIONS = ['Extremely Poor', 'Poor', 'Middle Class', 'Disabled'];
 const MARRIED = 'বিবাহিত';
 
+// ইউনিয়ন/পৌরসভার তালিকা (অ্যাপের তালিকার সাথে মিল রাখতে হবে); সব জায়গায় ওয়ার্ড ১–৯
+const AREA_NAMES = {
+  'ইউনিয়ন': [
+    'নাওগাঁও', 'পুটিজানা', 'কুশমাইল', 'বালিয়ান', 'দেওখোলা', 'ফুলবাড়ীয়া', 'বাক্তা',
+    'রাঙ্গামাটিয়া', 'এনায়েতপুর', 'কালাদহ', 'রাধাকানাই', 'আছিমপাটুলী', 'ভবানীপুর',
+  ],
+  'পৌরসভা': ['ফুলবাড়ীয়া পৌরসভা'],
+};
+const WARD_VALUES = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
+
 // ---------- সহায়ক ফাংশন ----------
 
 // বাংলা সংখ্যা → ইংরেজি সংখ্যা
@@ -68,6 +78,8 @@ function toCard(row) {
     spouseNid: row.spouse_nid,
     occupation: row.occupation,
     socialStatus: row.social_status,
+    areaType: row.area_type,
+    areaName: row.area_name,
     ward: row.ward,
     village: row.village,
     upazila: row.upazila,
@@ -104,6 +116,8 @@ function validate(body) {
     spouseNid: toEnglishDigits(str(body.spouseNid)),
     occupation: str(body.occupation),
     socialStatus: str(body.socialStatus),
+    areaType: str(body.areaType),
+    areaName: str(body.areaName),
     ward: toEnglishDigits(str(body.ward)),
     village: str(body.village),
     upazila: str(body.upazila),
@@ -113,11 +127,21 @@ function validate(body) {
     createdAt: str(body.createdAt),
   };
 
+  // গ্রামের ঘর এখন ইউনিয়ন/পৌরসভার নামের সমান; অ্যাপ না পাঠালেও areaName থেকে বসে যাবে
+  if (!v.village) v.village = v.areaName;
+
   const required = ['name', 'fatherName', 'motherName', 'nid', 'phone', 'dob', 'gender',
-    'maritalStatus', 'occupation', 'socialStatus', 'ward', 'village', 'upazila', 'district'];
+    'maritalStatus', 'occupation', 'socialStatus', 'areaType', 'areaName', 'ward', 'village', 'upazila', 'district'];
   for (const key of required) {
     if (!v[key]) errors.push(`${key} দেওয়া হয়নি`);
   }
+
+  if (v.areaType && !AREA_NAMES[v.areaType]) {
+    errors.push('areaType সঠিক নয় (ইউনিয়ন অথবা পৌরসভা)');
+  } else if (v.areaType && v.areaName && !AREA_NAMES[v.areaType].includes(v.areaName)) {
+    errors.push('areaName এই ধরনের তালিকায় নেই');
+  }
+  if (v.ward && !WARD_VALUES.includes(v.ward)) errors.push('ward ১ থেকে ৯ এর মধ্যে হতে হবে');
 
   if (v.nid && !/^\d{6,20}$/.test(v.nid)) errors.push('nid শুধু সংখ্যা হতে হবে (৬-২০ ডিজিট)');
   if (v.phone && !/^\+?\d{6,15}$/.test(v.phone)) errors.push('phone সঠিক নয়');
@@ -186,11 +210,13 @@ router.post('/', upload.single('photo'), (req, res) => {
     db.prepare(`
       INSERT INTO cards (
         unique_code, client_id, nid, name, father_name, mother_name, phone, dob, age, age_text,
-        gender, marital_status, spouse_nid, occupation, social_status, ward, village, upazila,
+        gender, marital_status, spouse_nid, occupation, social_status, area_type, area_name, ward,
+        village, upazila,
         district, photo, created_at, updated_at, created_by
       ) VALUES (
         @code, @clientId, @nid, @name, @fatherName, @motherName, @phone, @dob, @age, @ageText,
-        @gender, @maritalStatus, @spouseNid, @occupation, @socialStatus, @ward, @village, @upazila,
+        @gender, @maritalStatus, @spouseNid, @occupation, @socialStatus, @areaType, @areaName, @ward,
+        @village, @upazila,
         @district, @photo, @createdAt, @updatedAt, @createdBy
       )
     `).run({ ...v, code, photo: photoName, updatedAt: now, createdBy: req.user.id });
@@ -219,6 +245,17 @@ router.get('/', (req, res) => {
     .all({ ...params, limit, offset: (page - 1) * limit });
 
   res.json({ total, page, limit, items: rows.map(toCard) });
+});
+
+// GET /api/cards/check-nid/:nid — এই এনআইডির কার্ড সার্ভারে আগেই আছে কিনা (অ্যাপ লেখার সময় যাচাই করে)
+// অবশ্যই '/:code' রাউটের আগে থাকতে হবে
+router.get('/check-nid/:nid', (req, res) => {
+  const nid = toEnglishDigits(str(req.params.nid));
+  if (!/^\d{6,20}$/.test(nid)) {
+    return res.status(400).json({ error: 'এনআইডি শুধু সংখ্যা হতে হবে (৬-২০ ডিজিট)।' });
+  }
+  const row = db.prepare('SELECT 1 FROM cards WHERE nid = ?').get(nid);
+  res.json({ exists: Boolean(row) });
 });
 
 // GET /api/cards/:code — একটি কার্ড
@@ -269,7 +306,8 @@ router.put('/:code', upload.single('photo'), (req, res) => {
     UPDATE cards SET
       nid=@nid, name=@name, father_name=@fatherName, mother_name=@motherName, phone=@phone,
       dob=@dob, age=@age, age_text=@ageText, gender=@gender, marital_status=@maritalStatus,
-      spouse_nid=@spouseNid, occupation=@occupation, social_status=@socialStatus, ward=@ward,
+      spouse_nid=@spouseNid, occupation=@occupation, social_status=@socialStatus,
+      area_type=@areaType, area_name=@areaName, ward=@ward,
       village=@village, upazila=@upazila, district=@district, photo=@photo, updated_at=@updatedAt
     WHERE id=@id
   `).run({ ...v, photo: newPhoto || existing.photo, updatedAt: new Date().toISOString(), id: existing.id });
