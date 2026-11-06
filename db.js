@@ -36,8 +36,11 @@ db.exec(`
     spouse_nid     TEXT NOT NULL DEFAULT '',
     occupation     TEXT NOT NULL,
     social_status  TEXT NOT NULL,
+    area_type      TEXT NOT NULL DEFAULT '',   -- ইউনিয়ন | পৌরসভা
+    area_name      TEXT NOT NULL DEFAULT '',   -- ইউনিয়ন/পৌরসভার নাম
+    scanned_at     TEXT,                       -- অনুদানের কার্ড স্ক্যানের সময় (ISO); খালি (NULL) মানে এখনো স্ক্যান হয়নি
     ward           TEXT NOT NULL,
-    village        TEXT NOT NULL,
+    village        TEXT NOT NULL,              -- এখন area_name-এর সমান (পুরোনো কোডের জন্য)
     upazila        TEXT NOT NULL,
     district       TEXT NOT NULL,
     photo          TEXT NOT NULL DEFAULT '',   -- ছবির ফাইলের নাম (uploads ফোল্ডারে)
@@ -49,5 +52,17 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_cards_name  ON cards(name);
   CREATE INDEX IF NOT EXISTS idx_cards_phone ON cards(phone);
 `);
+
+// আগে থেকে তৈরি ডাটাবেসে নতুন দুটি কলাম যোগ করা (নতুন ডাটাবেসে CREATE TABLE-ই যথেষ্ট; পুরোনো ডেটা মুছে যায় না)
+const cardColumns = db.prepare('PRAGMA table_info(cards)').all().map((c) => c.name);
+if (!cardColumns.includes('area_type')) {
+  db.exec("ALTER TABLE cards ADD COLUMN area_type TEXT NOT NULL DEFAULT ''");
+}
+if (!cardColumns.includes('area_name')) {
+  db.exec("ALTER TABLE cards ADD COLUMN area_name TEXT NOT NULL DEFAULT ''");
+}
+if (!cardColumns.includes('scanned_at')) {
+  db.exec('ALTER TABLE cards ADD COLUMN scanned_at TEXT');
+}
 
 module.exports = db;
