@@ -147,8 +147,8 @@ function validate(body) {
     if (!v[key]) errors.push(`${key} দেওয়া হয়নি`);
   }
 
-  if (v.nid && !/^\d{6,20}$/.test(v.nid)) errors.push('nid শুধু সংখ্যা হতে হবে (৬-২০ ডিজিট)');
-  if (v.phone && !/^\+?\d{6,15}$/.test(v.phone)) errors.push('phone সঠিক নয়');
+  if (v.nid && !/^\d{1,20}$/.test(v.nid)) errors.push('nid শুধু সংখ্যা হতে হবে (সর্বোচ্চ ২০ ডিজিট)');
+  if (v.phone && !/^\+?\d{1,15}$/.test(v.phone)) errors.push('phone শুধু সংখ্যা হতে হবে (সর্বোচ্চ ১৫ ডিজিট)');
   if (v.dob && !isValidDob(v.dob)) errors.push('dob সঠিক নয় (DD/MM/YYYY)');
   if (v.gender && !GENDER_OPTIONS.includes(v.gender)) errors.push('gender সঠিক নয়');
   if (v.maritalStatus && !MARITAL_OPTIONS.includes(v.maritalStatus)) errors.push('maritalStatus সঠিক নয়');
@@ -239,6 +239,10 @@ router.post('/', upload.single('photo'), (req, res) => {
     res.status(201).json({ card: toCard(findAny(code)) });
   } catch (err) {
     removePhoto(photoName);
+    // একই সময়ে দুজন একই এনআইডি পাঠালে ডাটাবেসের ইউনিক ইনডেক্স দ্বিতীয়জনকে ঠেকিয়ে দেয়
+    if (err && String(err.code).startsWith('SQLITE_CONSTRAINT') && String(err.message).includes('cards.nid')) {
+      return res.status(409).json({ error: 'এই এনআইডি দিয়ে কার্ড আগেই তৈরি করা আছে।' });
+    }
     console.error('Card insert error:', err);
     res.status(500).json({ error: 'কার্ড সংরক্ষণ করতে সমস্যা হয়েছে।' });
   }
@@ -270,6 +274,17 @@ router.get('/', (req, res) => {
     .all({ ...params, limit, offset: (page - 1) * limit });
 
   res.json({ total, page, limit, items: rows.map(toCard) });
+});
+
+// GET /api/cards/check-nid/:nid — এই এনআইডি দিয়ে সার্ভারে সক্রিয় কার্ড আছে কিনা (শুধু আছে/নেই জানায়, অন্য তথ্য নয়)
+// অবশ্যই '/:code' রাউটের আগে থাকতে হবে, নাহলে 'check-nid' কে কোড ভেবে ফেলবে
+router.get('/check-nid/:nid', (req, res) => {
+  const nid = toEnglishDigits(str(req.params.nid));
+  if (!/^\d{1,20}$/.test(nid)) {
+    return res.status(400).json({ error: 'এনআইডি শুধু সংখ্যা হতে হবে।' });
+  }
+  const row = db.prepare('SELECT 1 FROM cards WHERE nid = ? AND deleted_at IS NULL').get(nid);
+  res.json({ exists: Boolean(row) });
 });
 
 // GET /api/cards/:code — একটি কার্ডের তথ্য
