@@ -5,7 +5,6 @@ const path = require('path');
 const rateLimit = require('express-rate-limit');
 const db = require('./db');
 const { UPLOAD_DIR } = require('./upload');
-const { logEvent } = require('./events');
 
 const router = express.Router();
 
@@ -37,14 +36,6 @@ router.get('/:code', (req, res) => {
     return res.status(404).json({ valid: false, error: 'এই কোডের কোনো কার্ড পাওয়া যায়নি।' });
   }
 
-  // মুছে ফেলা (বাতিল) কার্ড আর বৈধ নয়, তবে যাচাইয়ের চেষ্টাটি ইতিহাসে থাকে
-  if (row.deleted_at) {
-    logEvent({ cardId: row.id, uniqueCode: row.unique_code, action: 'verify_revoked', ip: req.ip });
-    return res.status(410).json({ valid: false, error: 'এই কার্ডটি বাতিল করা হয়েছে।' });
-  }
-
-  logEvent({ cardId: row.id, uniqueCode: row.unique_code, action: 'verified', ip: req.ip });
-
   const showPhoto = process.env.VERIFY_SHOW_PHOTO === 'true' && row.photo;
 
   res.json({
@@ -71,7 +62,7 @@ router.get('/:code/photo', (req, res) => {
   if (process.env.VERIFY_SHOW_PHOTO !== 'true' || !isCode(code)) {
     return res.status(404).json({ error: 'পাওয়া যায়নি।' });
   }
-  const row = db.prepare('SELECT photo FROM cards WHERE unique_code = ? AND deleted_at IS NULL').get(code);
+  const row = db.prepare('SELECT photo FROM cards WHERE unique_code = ?').get(code);
   if (!row || !row.photo) return res.status(404).json({ error: 'পাওয়া যায়নি।' });
   res.sendFile(path.join(UPLOAD_DIR, path.basename(row.photo)));
 });
