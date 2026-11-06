@@ -168,6 +168,25 @@ function validate(body) {
   return { errors, value: v };
 }
 
+// স্বামী/স্ত্রীর এনআইডি নিয়ে সমস্যা আছে কিনা:
+// - নিজের এনআইডি ও স্বামী/স্ত্রীর এনআইডি এক হতে পারবে না
+// - স্বামী/স্ত্রীর এনআইডি দিয়ে সার্ভারে আগেই সক্রিয় কার্ড থাকলে নিবন্ধন হবে না
+// সমস্যা থাকলে { status, error } ফেরত দেয়, না থাকলে null
+function spouseProblem(v) {
+  if (!v.spouseNid) return null;
+  if (v.spouseNid === v.nid) {
+    return { status: 400, error: 'নিজের এনআইডি ও স্বামী/স্ত্রীর এনআইডি এক হতে পারে না।' };
+  }
+  const row = db.prepare('SELECT 1 FROM cards WHERE nid = ? AND deleted_at IS NULL').get(v.spouseNid);
+  if (row) {
+    return {
+      status: 409,
+      error: 'স্বামী/স্ত্রীর এনআইডি নম্বর দিয়ে সার্ভারে আগেই কার্ড আছে, তাই এই নিবন্ধন করা যাবে না।',
+    };
+  }
+  return null;
+}
+
 // ---------- রাউট ----------
 
 // POST /api/cards — নতুন কার্ডের তথ্য (JSON অথবা multipart: photo + data)
@@ -209,6 +228,13 @@ router.post('/', upload.single('photo'), (req, res) => {
       error: 'এই এনআইডি দিয়ে কার্ড আগেই তৈরি করা আছে।',
       uniqueCode: nidRow.unique_code,
     });
+  }
+
+  // স্বামী/স্ত্রীর এনআইডি সার্ভারে আগেই থাকলে (বা নিজের এনআইডির সাথে এক হলে) নতুন কার্ড হবে না
+  const spouseIssue = spouseProblem(v);
+  if (spouseIssue) {
+    removePhoto(photoName);
+    return res.status(spouseIssue.status).json({ error: spouseIssue.error, field: 'spouseNid' });
   }
 
   try {
@@ -368,6 +394,13 @@ router.put('/:code', upload.single('photo'), (req, res) => {
   if (clash) {
     removePhoto(newPhoto);
     return res.status(409).json({ error: 'এই এনআইডি অন্য কার্ডে ব্যবহার হয়েছে।', uniqueCode: clash.unique_code });
+  }
+
+  // বদলানোর সময়: স্বামী/স্ত্রীর এনআইডি নতুন করে দিলে বা বদলালে একই যাচাই (আগের সেভ করা মান অপরিবর্তিত থাকলে পুরনো তথ্য আটকাবে না)
+  const spouseIssue = v.spouseNid !== existing.spouse_nid || v.spouseNid === v.nid ? spouseProblem(v) : null;
+  if (spouseIssue) {
+    removePhoto(newPhoto);
+    return res.status(spouseIssue.status).json({ error: spouseIssue.error, field: 'spouseNid' });
   }
 
   // কোন ঘরে কী ছিল, কী হলো — আগে-পরে তুলনা
