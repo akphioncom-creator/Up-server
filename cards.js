@@ -12,9 +12,14 @@ const router = express.Router();
 // নইলে কার্ড সেভের সময় "no column named area_type" ত্রুটিতে কার্ড সংরক্ষণ হবে না
 {
   const existingCols = db.prepare('PRAGMA table_info(cards)').all().map((c) => c.name);
-  for (const col of ['area_type', 'area_name']) {
+  const neededCols = {
+    area_type: "TEXT NOT NULL DEFAULT ''",
+    area_name: "TEXT NOT NULL DEFAULT ''",
+    scanned_at: 'TEXT', // স্ক্যানের সময়; NULL মানে এখনো স্ক্যান হয়নি
+  };
+  for (const [col, ddl] of Object.entries(neededCols)) {
     if (!existingCols.includes(col)) {
-      db.exec(`ALTER TABLE cards ADD COLUMN ${col} TEXT NOT NULL DEFAULT ''`);
+      db.exec(`ALTER TABLE cards ADD COLUMN ${col} ${ddl}`);
     }
   }
 }
@@ -98,6 +103,7 @@ function toCard(row) {
     photoUrl: row.photo ? `/api/cards/${row.unique_code}/photo` : '',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    scannedAt: row.scanned_at || null,
   };
 }
 
@@ -267,6 +273,48 @@ router.get('/check-nid/:nid', (req, res) => {
   }
   const row = db.prepare('SELECT 1 FROM cards WHERE nid = ?').get(nid);
   res.json({ exists: Boolean(row) });
+});
+
+// ---------- অনুদানের কার্ড স্ক্যান: একটি কার্ড একবারই স্ক্যান হবে ----------
+
+// কতটি কার্ড মোট, কতটি স্ক্যান হয়েছে
+const scanCounts = () =>
+  db.prepare('SELECT COUNT(*) AS total, COUNT(scanned_at) AS scanned FROM cards').get();
+
+// GET /api/cards/scans/summary — স্ক্যানের অগ্রগতি (পারসন লিস্টে "সব স্ক্যান হয়েছে কিনা" দেখাতে)
+router.get('/scans/summary', (req, res) => {
+  res.json(scanCounts());
+});
+
+// POST /api/cards/scans/reset — নতুন দফা শুরু: সব কার্ডের স্ক্যান চিহ্ন মুছে আবার সবাইকে স্ক্যান করার যোগ্য করা (শুধু admin)
+router.post('/scans/reset', requireRole('admin'), (req, res) => {
+  const result = db.prepare('UPDATE cards SET scanned_at = NULL WHERE scanned_at IS NOT NULL').run();
+  res.json({ ok: true, cleared: result.changes, summary: scanCounts() });
+});
+
+// POST /api/cards/:code/scan — কিউআর স্ক্যান: প্রথমবার হলে "স্ক্যান হয়েছে" চিহ্ন বসে, আগে হয়ে থাকলে 409
+// চিহ্ন বসানোর কাজটা একটি আদেশেই হয়, তাই দুই ফোন একই সময়ে একই কার্ড স্ক্যান করলেও শুধু একজন সফল হবে
+router.post('/:code/scan', (req, res) => {
+  const code = req.params.code;
+  if (!/^\d{12,13}$/.test(code)) {
+    return res.status(404).json({ status: 'notfound', error: 'এই কোডের কোনো কার্ড পাওয়া যায়নি।' });
+  }
+
+  const now = new Date().toISOString();
+  const claim = db
+    .prepare('UPDATE cards SET scanned_at = ? WHERE unique_code = ? AND scanned_at IS NULL')
+    .run(now, code);
+
+  const row = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(code);
+  if (!row) {
+    return res.status(404).json({ status: 'notfound', error: 'এই কোডের কোনো কার্ড পাওয়া যায়নি।' });
+  }
+
+  const summary = scanCounts();
+  if (claim.changes === 1) {
+    return res.json({ status: 'success', card: toCard(row), summary });
+  }
+  res.status(409).json({ status: 'duplicate', card: toCard(row), summary });
 });
 
 // GET /api/cards/:code — একটি কার্ড
