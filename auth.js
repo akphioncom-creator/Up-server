@@ -115,9 +115,11 @@ const signAppToken = (user) =>
   );
 
 // পাসওয়ার্ড যাচাই/বদলের চেষ্টাও সীমিত: কেউ ফোন হাতে পেয়ে পাসওয়ার্ড আন্দাজ করতে না পারে
+// শুধু ভুল চেষ্টা গোনা হয় (skipSuccessfulRequests): অ্যাপে লক-অপশনে বারবার সঠিক পাসওয়ার্ড দিয়ে স্ক্রিনে ঢুকলে যেন আটকে না যায়
 const passwordLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
+  skipSuccessfulRequests: true,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'অনেকবার চেষ্টা হয়েছে, ১৫ মিনিট পরে আবার চেষ্টা করুন।' },
