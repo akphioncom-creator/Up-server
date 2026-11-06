@@ -8,6 +8,17 @@ const { requireRole } = require('./auth');
 
 const router = express.Router();
 
+// নিরাপত্তা-জাল: ডাটাবেসে ইউনিয়ন/পৌরসভার কলাম দুটি না থাকলে (যেমন পুরোনো db.js বা পুরোনো ডাটাবেস ফাইল) এখানেই যোগ হয়ে যাবে,
+// নইলে কার্ড সেভের সময় "no column named area_type" ত্রুটিতে কার্ড সংরক্ষণ হবে না
+{
+  const existingCols = db.prepare('PRAGMA table_info(cards)').all().map((c) => c.name);
+  for (const col of ['area_type', 'area_name']) {
+    if (!existingCols.includes(col)) {
+      db.exec(`ALTER TABLE cards ADD COLUMN ${col} TEXT NOT NULL DEFAULT ''`);
+    }
+  }
+}
+
 const GENDER_OPTIONS = ['পুরুষ', 'মহিলা', 'তৃতীয় লিঙ্গ'];
 const MARITAL_OPTIONS = ['বিবাহিত', 'অবিবাহিত', 'বিধবা', 'বিপত্নিক'];
 const OCCUPATION_OPTIONS = ['কৃষক', 'শ্রমিক', 'ব্যবসায়ী', 'গৃহিণী', 'অন্যান্য'];
