@@ -51,6 +51,12 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_cards_name  ON cards(name);
   CREATE INDEX IF NOT EXISTS idx_cards_phone ON cards(phone);
+
+  -- সার্ভারের ছোট সেটিংস: অ্যাপের বদলানো পাসওয়ার্ড (হ্যাশ করা) ও টোকেন সংস্করণ
+  CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
 `);
 
 // আগে থেকে তৈরি ডাটাবেসে নতুন দুটি কলাম যোগ করা (নতুন ডাটাবেসে CREATE TABLE-ই যথেষ্ট; পুরোনো ডেটা মুছে যায় না)
