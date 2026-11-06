@@ -1,63 +1,21 @@
-// ইতিহাস (অডিট লগ): কার্ডের সাথে যা কিছু ঘটে সব এখানে জমা হয়
-const db = require('./db');
+# এই ফাইলটি কপি করে .env নামে রাখুন এবং মান বদলান
+PORT=3000
 
-// অ্যাকশনের বাংলা নাম (অ্যাপে দেখানোর সুবিধার জন্য)
-const ACTION_LABELS = {
-  created: 'কার্ড তৈরি হয়েছে',
-  updated: 'তথ্য বদলানো হয়েছে',
-  card_opened: 'কার্ড খোলা হয়েছে',
-  card_saved: 'কার্ড গ্যালারিতে সেভ করা হয়েছে',
-  verified: 'কিউআর কোড যাচাই করা হয়েছে',
-  verify_revoked: 'বাতিল কার্ড যাচাইয়ের চেষ্টা হয়েছে',
-  duplicate_submit: 'একই তথ্য আবার পাঠানো হয়েছে (নতুন কার্ড হয়নি)',
-  deleted: 'কার্ড মুছে ফেলা হয়েছে',
-  restored: 'কার্ড ফিরিয়ে আনা হয়েছে',
-};
+# অবশ্যই লম্বা ও এলোমেলো একটি গোপন লেখা দিন (কমপক্ষে ৩২ অক্ষর)
+# তৈরি করার উপায়: node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
+JWT_SECRET=
+JWT_EXPIRES_IN=7d
 
-// অ্যাপ নিজে যে অ্যাকশনগুলো জানাতে পারবে (বাকিগুলো শুধু সার্ভার নিজে বসায়)
-const CLIENT_ACTIONS = ['card_opened', 'card_saved'];
+# অ্যাপে ঢোকার পাসওয়ার্ড: শুধু এই পাসওয়ার্ড দিলেই অ্যাপে লগইন হবে (বদলাতে চাইলে এখানে বদলে সার্ভার আবার চালু করুন)
+# এটি না দিলে অ্যাপের লগইন কাজ করবে না
+APP_PASSWORD=1234
 
-const insert = db.prepare(`
-  INSERT INTO events (card_id, unique_code, action, actor_id, actor_name, details, ip)
-  VALUES (?, ?, ?, ?, ?, ?, ?)
-`);
+# ওয়েব থেকে ডাকলে কোন ঠিকানা অনুমতি পাবে (কমা দিয়ে একাধিক)। মোবাইল অ্যাপের জন্য লাগে না
+CORS_ORIGIN=
 
-// ইতিহাস লিখতে গিয়ে ত্রুটি হলেও মূল কাজ যেন আটকে না যায়, তাই try/catch
-function logEvent({ cardId = null, uniqueCode, action, user = null, ip = null, details = null }) {
-  try {
-    insert.run(
-      cardId,
-      uniqueCode,
-      action,
-      user ? user.id : null,
-      user ? user.username : null,
-      details ? JSON.stringify(details) : null,
-      ip
-    );
-  } catch (err) {
-    console.error('Event log error:', err);
-  }
-}
+# নগিনক্স/ক্লাউড প্রক্সির পেছনে চালালে 1 দিন
+TRUST_PROXY=0
 
-function toEvent(row) {
-  let details = null;
-  if (row.details) {
-    try {
-      details = JSON.parse(row.details);
-    } catch (e) {
-      details = null;
-    }
-  }
-  return {
-    id: row.id,
-    uniqueCode: row.unique_code,
-    action: row.action,
-    label: ACTION_LABELS[row.action] || row.action,
-    actor: row.actor_name || null,
-    details,
-    ip: row.ip,
-    at: row.created_at,
-  };
-}
+# কিউআর যাচাইয়ে (verify) ছবি দেখানো হবে কিনা: true / false
+VERIFY_SHOW_PHOTO=false
 
-module.exports = { logEvent, toEvent, ACTION_LABELS, CLIENT_ACTIONS };
