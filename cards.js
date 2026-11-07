@@ -8,22 +8,6 @@ const { requireRole } = require('./auth');
 
 const router = express.Router();
 
-// নিরাপত্তা-জাল: ডাটাবেসে ইউনিয়ন/পৌরসভার কলাম দুটি না থাকলে (যেমন পুরোনো db.js বা পুরোনো ডাটাবেস ফাইল) এখানেই যোগ হয়ে যাবে,
-// নইলে কার্ড সেভের সময় "no column named area_type" ত্রুটিতে কার্ড সংরক্ষণ হবে না
-{
-  const existingCols = db.prepare('PRAGMA table_info(cards)').all().map((c) => c.name);
-  const neededCols = {
-    area_type: "TEXT NOT NULL DEFAULT ''",
-    area_name: "TEXT NOT NULL DEFAULT ''",
-    scanned_at: 'TEXT', // স্ক্যানের সময়; NULL মানে এখনো স্ক্যান হয়নি
-  };
-  for (const [col, ddl] of Object.entries(neededCols)) {
-    if (!existingCols.includes(col)) {
-      db.exec(`ALTER TABLE cards ADD COLUMN ${col} ${ddl}`);
-    }
-  }
-}
-
 const GENDER_OPTIONS = ['পুরুষ', 'মহিলা', 'তৃতীয় লিঙ্গ'];
 const MARITAL_OPTIONS = ['বিবাহিত', 'অবিবাহিত', 'বিধবা', 'বিপত্নিক'];
 const OCCUPATION_OPTIONS = ['কৃষক', 'শ্রমিক', 'ব্যবসায়ী', 'গৃহিণী', 'অন্যান্য'];
@@ -66,12 +50,12 @@ const isValidDob = (value) => {
   return d.getTime() <= now.getTime();
 };
 
-// ১২ ডিজিটের এমন কোড তৈরি যা আগে নেই (crypto দিয়ে, Math.random নয়)
-const codeExists = db.prepare('SELECT 1 FROM cards WHERE unique_code = ?');
-function generateUniqueCode() {
+// ১২ ডিজিটের এমন কোড তৈরি যা আগে নেই (crypto দিয়ে)
+async function generateUniqueCode() {
   for (let i = 0; i < 30; i++) {
     const code = String(crypto.randomInt(100000000000, 1000000000000));
-    if (!codeExists.get(code)) return code;
+    const res = await db.query('SELECT 1 FROM cards WHERE unique_code = $1', [code]);
+    if (res.rows.length === 0) return code;
   }
   throw new Error('ইউনিক কোড তৈরি করা যায়নি');
 }
@@ -144,7 +128,6 @@ function validate(body) {
     createdAt: str(body.createdAt),
   };
 
-  // গ্রামের ঘর এখন ইউনিয়ন/পৌরসভার নামের সমান; অ্যাপ না পাঠালেও areaName থেকে বসে যাবে
   if (!v.village) v.village = v.areaName;
 
   const required = ['name', 'fatherName', 'motherName', 'nid', 'phone', 'dob', 'gender',
@@ -174,7 +157,6 @@ function validate(body) {
     v.spouseNid = '';
   }
 
-  // কার্ড তৈরির তারিখ: অ্যাপ ISO তারিখ দিলে সেটা, না দিলে সার্ভারের এখনকার সময়
   const parsed = v.createdAt ? new Date(v.createdAt) : null;
   v.createdAt = parsed && !isNaN(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
 
@@ -183,8 +165,8 @@ function validate(body) {
 
 // ---------- রাউট ----------
 
-// POST /api/cards — নতুন কার্ড (JSON অথবা multipart: photo + data)
-router.post('/', upload.single('photo'), (req, res) => {
+// POST /api/cards — নতুন কার্ড
+router.post('/', upload.single('photo'), async (req, res) => {
   const photoName = req.file ? req.file.filename : '';
 
   let body;
@@ -201,45 +183,48 @@ router.post('/', upload.single('photo'), (req, res) => {
     return res.status(400).json({ error: 'তথ্য সঠিক নয়', details: errors });
   }
 
-  // একই ডেটা দুইবার পাঠালে (যেমন নেট কেটে গিয়ে আবার পাঠানো) নতুন কার্ড না বানিয়ে আগেরটাই ফেরত
-  if (v.clientId) {
-    const same = db.prepare('SELECT * FROM cards WHERE client_id = ?').get(v.clientId);
-    if (same) {
-      removePhoto(photoName);
-      return res.status(200).json({ card: toCard(same), duplicate: true });
-    }
-  }
-
-  // একই এনআইডি-র কার্ড আগেই থাকলে নতুন তৈরি হবে না
-  const nidRow = db.prepare('SELECT * FROM cards WHERE nid = ?').get(v.nid);
-  if (nidRow) {
-    removePhoto(photoName);
-    return res.status(409).json({
-      error: 'এই এনআইডি দিয়ে কার্ড আগেই তৈরি করা আছে।',
-      uniqueCode: nidRow.unique_code,
-    });
-  }
-
   try {
-    const code = generateUniqueCode();
+    if (v.clientId) {
+      const sameRes = await db.query('SELECT * FROM cards WHERE client_id = $1', [v.clientId]);
+      if (sameRes.rows.length > 0) {
+        removePhoto(photoName);
+        return res.status(200).json({ card: toCard(sameRes.rows[0]), duplicate: true });
+      }
+    }
+
+    const nidRes = await db.query('SELECT * FROM cards WHERE nid = $1', [v.nid]);
+    if (nidRes.rows.length > 0) {
+      removePhoto(photoName);
+      return res.status(409).json({
+        error: 'এই এনআইডি দিয়ে কার্ড আগেই তৈরি করা আছে।',
+        uniqueCode: nidRes.rows[0].unique_code,
+      });
+    }
+
+    const code = await generateUniqueCode();
     const now = new Date().toISOString();
 
-    db.prepare(`
+    await db.query(`
       INSERT INTO cards (
         unique_code, client_id, nid, name, father_name, mother_name, phone, dob, age, age_text,
         gender, marital_status, spouse_nid, occupation, social_status, area_type, area_name, ward,
         village, upazila,
         district, photo, created_at, updated_at, created_by
       ) VALUES (
-        @code, @clientId, @nid, @name, @fatherName, @motherName, @phone, @dob, @age, @ageText,
-        @gender, @maritalStatus, @spouseNid, @occupation, @socialStatus, @areaType, @areaName, @ward,
-        @village, @upazila,
-        @district, @photo, @createdAt, @updatedAt, @createdBy
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+        $11, $12, $13, $14, $15, $16, $17, $18,
+        $19, $20,
+        $21, $22, $23, $24, $25
       )
-    `).run({ ...v, code, photo: photoName, updatedAt: now, createdBy: req.user.id });
+    `, [
+      code, v.clientId, v.nid, v.name, v.fatherName, v.motherName, v.phone, v.dob, v.age, v.ageText,
+      v.gender, v.maritalStatus, v.spouseNid, v.occupation, v.socialStatus, v.areaType, v.areaName, v.ward,
+      v.village, v.upazila,
+      v.district, photoName, v.createdAt, now, req.user.id
+    ]);
 
-    const row = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(code);
-    res.status(201).json({ card: toCard(row) });
+    const rowRes = await db.query('SELECT * FROM cards WHERE unique_code = $1', [code]);
+    res.status(201).json({ card: toCard(rowRes.rows[0]) });
   } catch (err) {
     removePhoto(photoName);
     console.error('Card insert error:', err);
@@ -248,143 +233,213 @@ router.post('/', upload.single('photo'), (req, res) => {
 });
 
 // GET /api/cards?page=1&limit=50&q=রহিম — তালিকা ও খোঁজা
-router.get('/', (req, res) => {
-  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
-  const q = str(req.query.q);
+router.get('/', async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    const q = str(req.query.q);
+    const offset = (page - 1) * limit;
 
-  const where = q ? 'WHERE name LIKE @like OR nid LIKE @like OR phone LIKE @like OR unique_code LIKE @like' : '';
-  const params = q ? { like: `%${q}%` } : {};
+    let where = '';
+    let params = [];
 
-  const total = db.prepare(`SELECT COUNT(*) AS n FROM cards ${where}`).get(params).n;
-  const rows = db
-    .prepare(`SELECT * FROM cards ${where} ORDER BY created_at DESC LIMIT @limit OFFSET @offset`)
-    .all({ ...params, limit, offset: (page - 1) * limit });
+    if (q) {
+      where = 'WHERE name ILIKE $1 OR nid ILIKE $1 OR phone ILIKE $1 OR unique_code ILIKE $1';
+      params.push(`%${q}%`);
+    }
 
-  res.json({ total, page, limit, items: rows.map(toCard) });
-});
+    const countRes = await db.query(`SELECT COUNT(*) AS n FROM cards ${where}`, params);
+    const total = parseInt(countRes.rows[0].n, 10);
 
-// GET /api/cards/check-nid/:nid — এই এনআইডির কার্ড সার্ভারে আগেই আছে কিনা (অ্যাপ লেখার সময় যাচাই করে)
-// অবশ্যই '/:code' রাউটের আগে থাকতে হবে
-router.get('/check-nid/:nid', (req, res) => {
-  const nid = toEnglishDigits(str(req.params.nid));
-  if (!/^\d{6,20}$/.test(nid)) {
-    return res.status(400).json({ error: 'এনআইডি শুধু সংখ্যা হতে হবে (৬-২০ ডিজিট)।' });
+    let queryParams = [...params];
+    queryParams.push(limit, offset);
+    const rowsQuery = `SELECT * FROM cards ${where} ORDER BY created_at DESC LIMIT $${queryParams.length - 1} OFFSET $${queryParams.length}`;
+    
+    const rowsRes = await db.query(rowsQuery, queryParams);
+
+    res.json({ total, page, limit, items: rowsRes.rows.map(toCard) });
+  } catch (err) {
+    console.error('Cards list error:', err);
+    res.status(500).json({ error: 'ডেটা লোড করতে সমস্যা হয়েছে।' });
   }
-  const row = db.prepare('SELECT 1 FROM cards WHERE nid = ?').get(nid);
-  res.json({ exists: Boolean(row) });
 });
 
-// ---------- অনুদানের কার্ড স্ক্যান: একটি কার্ড একবারই স্ক্যান হবে ----------
-
-// কতটি কার্ড মোট, কতটি স্ক্যান হয়েছে
-const scanCounts = () =>
-  db.prepare('SELECT COUNT(*) AS total, COUNT(scanned_at) AS scanned FROM cards').get();
-
-// GET /api/cards/scans/summary — স্ক্যানের অগ্রগতি (পারসন লিস্টে "সব স্ক্যান হয়েছে কিনা" দেখাতে)
-router.get('/scans/summary', (req, res) => {
-  res.json(scanCounts());
+// GET /api/cards/check-nid/:nid
+router.get('/check-nid/:nid', async (req, res) => {
+  try {
+    const nid = toEnglishDigits(str(req.params.nid));
+    if (!/^\d{6,20}$/.test(nid)) {
+      return res.status(400).json({ error: 'এনআইডি শুধু সংখ্যা হতে হবে (৬-২০ ডিজিট)।' });
+    }
+    const rowRes = await db.query('SELECT 1 FROM cards WHERE nid = $1', [nid]);
+    res.json({ exists: rowRes.rows.length > 0 });
+  } catch (err) {
+    console.error('Check NID error:', err);
+    res.status(500).json({ error: 'সার্ভার ত্রুটি।' });
+  }
 });
 
-// POST /api/cards/scans/reset — নতুন দফা শুরু: সব কার্ডের স্ক্যান চিহ্ন মুছে আবার সবাইকে স্ক্যান করার যোগ্য করা (শুধু admin)
-router.post('/scans/reset', requireRole('admin'), (req, res) => {
-  const result = db.prepare('UPDATE cards SET scanned_at = NULL WHERE scanned_at IS NOT NULL').run();
-  res.json({ ok: true, cleared: result.changes, summary: scanCounts() });
+// ---------- অনুদানের কার্ড স্ক্যান ----------
+
+const scanCounts = async () => {
+  const res = await db.query('SELECT COUNT(*) AS total, COUNT(scanned_at) AS scanned FROM cards');
+  return {
+    total: parseInt(res.rows[0].total, 10),
+    scanned: parseInt(res.rows[0].scanned, 10)
+  };
+};
+
+router.get('/scans/summary', async (req, res) => {
+  try {
+    const summary = await scanCounts();
+    res.json(summary);
+  } catch (err) {
+    console.error('Scan summary error:', err);
+    res.status(500).json({ error: 'সার্ভার ত্রুটি।' });
+  }
 });
 
-// POST /api/cards/:code/scan — কিউআর স্ক্যান: প্রথমবার হলে "স্ক্যান হয়েছে" চিহ্ন বসে, আগে হয়ে থাকলে 409
-// চিহ্ন বসানোর কাজটা একটি আদেশেই হয়, তাই দুই ফোন একই সময়ে একই কার্ড স্ক্যান করলেও শুধু একজন সফল হবে
-router.post('/:code/scan', (req, res) => {
+router.post('/scans/reset', requireRole('admin'), async (req, res) => {
+  try {
+    const result = await db.query('UPDATE cards SET scanned_at = NULL WHERE scanned_at IS NOT NULL');
+    const summary = await scanCounts();
+    res.json({ ok: true, cleared: result.rowCount, summary });
+  } catch (err) {
+    console.error('Scan reset error:', err);
+    res.status(500).json({ error: 'সার্ভার ত্রুটি।' });
+  }
+});
+
+router.post('/:code/scan', async (req, res) => {
   const code = req.params.code;
   if (!/^\d{12,13}$/.test(code)) {
     return res.status(404).json({ status: 'notfound', error: 'এই কোডের কোনো কার্ড পাওয়া যায়নি।' });
   }
 
-  const now = new Date().toISOString();
-  const claim = db
-    .prepare('UPDATE cards SET scanned_at = ? WHERE unique_code = ? AND scanned_at IS NULL')
-    .run(now, code);
+  try {
+    const now = new Date().toISOString();
+    const claim = await db.query(
+      'UPDATE cards SET scanned_at = $1 WHERE unique_code = $2 AND scanned_at IS NULL',
+      [now, code]
+    );
 
-  const row = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(code);
-  if (!row) {
-    return res.status(404).json({ status: 'notfound', error: 'এই কোডের কোনো কার্ড পাওয়া যায়নি।' });
+    const rowRes = await db.query('SELECT * FROM cards WHERE unique_code = $1', [code]);
+    if (rowRes.rows.length === 0) {
+      return res.status(404).json({ status: 'notfound', error: 'এই কোডের কোনো কার্ড পাওয়া যায়নি।' });
+    }
+
+    const row = rowRes.rows[0];
+    const summary = await scanCounts();
+    if (claim.rowCount === 1) {
+      return res.json({ status: 'success', card: toCard(row), summary });
+    }
+    res.status(409).json({ status: 'duplicate', card: toCard(row), summary });
+  } catch (err) {
+    console.error('Scan error:', err);
+    res.status(500).json({ error: 'সার্ভার ত্রুটি।' });
   }
+});
 
-  const summary = scanCounts();
-  if (claim.changes === 1) {
-    return res.json({ status: 'success', card: toCard(row), summary });
+// GET /api/cards/:code
+router.get('/:code', async (req, res) => {
+  try {
+    const rowRes = await db.query('SELECT * FROM cards WHERE unique_code = $1', [req.params.code]);
+    if (rowRes.rows.length === 0) return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
+    res.json({ card: toCard(rowRes.rows[0]) });
+  } catch (err) {
+    console.error('Get card error:', err);
+    res.status(500).json({ error: 'সার্ভার ত্রুটি।' });
   }
-  res.status(409).json({ status: 'duplicate', card: toCard(row), summary });
 });
 
-// GET /api/cards/:code — একটি কার্ড
-router.get('/:code', (req, res) => {
-  const row = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(req.params.code);
-  if (!row) return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
-  res.json({ card: toCard(row) });
+// GET /api/cards/:code/photo
+router.get('/:code/photo', async (req, res) => {
+  try {
+    const rowRes = await db.query('SELECT photo FROM cards WHERE unique_code = $1', [req.params.code]);
+    if (rowRes.rows.length === 0 || !rowRes.rows[0].photo) return res.status(404).json({ error: 'ছবি পাওয়া যায়নি।' });
+    res.sendFile(path.join(UPLOAD_DIR, path.basename(rowRes.rows[0].photo)));
+  } catch (err) {
+    console.error('Photo error:', err);
+    res.status(500).json({ error: 'সার্ভার ত্রুটি।' });
+  }
 });
 
-// GET /api/cards/:code/photo — ছবি (লগইন করা ব্যবহারকারীর জন্য)
-router.get('/:code/photo', (req, res) => {
-  const row = db.prepare('SELECT photo FROM cards WHERE unique_code = ?').get(req.params.code);
-  if (!row || !row.photo) return res.status(404).json({ error: 'ছবি পাওয়া যায়নি।' });
-  res.sendFile(path.join(UPLOAD_DIR, path.basename(row.photo)));
-});
-
-// PUT /api/cards/:code — তথ্য বদলানো (নতুন ছবি দিলে পুরনোটা মুছে যাবে; কোড বদলায় না)
-router.put('/:code', upload.single('photo'), (req, res) => {
+// PUT /api/cards/:code
+router.put('/:code', upload.single('photo'), async (req, res) => {
   const newPhoto = req.file ? req.file.filename : '';
 
-  const existing = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(req.params.code);
-  if (!existing) {
-    removePhoto(newPhoto);
-    return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
-  }
-
-  let body;
   try {
-    body = readPayload(req);
-  } catch (e) {
+    const existingRes = await db.query('SELECT * FROM cards WHERE unique_code = $1', [req.params.code]);
+    if (existingRes.rows.length === 0) {
+      removePhoto(newPhoto);
+      return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
+    }
+    const existing = existingRes.rows[0];
+
+    let body;
+    try {
+      body = readPayload(req);
+    } catch (e) {
+      removePhoto(newPhoto);
+      return res.status(400).json({ error: 'data ফিল্ডের JSON সঠিক নয়।' });
+    }
+
+    const { errors, value: v } = validate(body);
+    if (errors.length) {
+      removePhoto(newPhoto);
+      return res.status(400).json({ error: 'তথ্য সঠিক নয়', details: errors });
+    }
+
+    const clashRes = await db.query('SELECT unique_code FROM cards WHERE nid = $1 AND id != $2', [v.nid, existing.id]);
+    if (clashRes.rows.length > 0) {
+      removePhoto(newPhoto);
+      return res.status(409).json({ error: 'এই এনআইডি অন্য কার্ডে ব্যবহার হয়েছে।', uniqueCode: clashRes.rows[0].unique_code });
+    }
+
+    const updatedAt = new Date().toISOString();
+    const photoToSave = newPhoto || existing.photo;
+
+    await db.query(`
+      UPDATE cards SET
+        nid=$1, name=$2, father_name=$3, mother_name=$4, phone=$5,
+        dob=$6, age=$7, age_text=$8, gender=$9, marital_status=$10,
+        spouse_nid=$11, occupation=$12, social_status=$13,
+        area_type=$14, area_name=$15, ward=$16,
+        village=$17, upazila=$18, district=$19, photo=$20, updated_at=$21
+      WHERE id=$22
+    `, [
+      v.nid, v.name, v.fatherName, v.motherName, v.phone,
+      v.dob, v.age, v.ageText, v.gender, v.maritalStatus,
+      v.spouseNid, v.occupation, v.socialStatus,
+      v.areaType, v.areaName, v.ward,
+      v.village, v.upazila, v.district, photoToSave, updatedAt, existing.id
+    ]);
+
+    if (newPhoto && existing.photo) removePhoto(existing.photo);
+
+    const rowRes = await db.query('SELECT * FROM cards WHERE id = $1', [existing.id]);
+    res.json({ card: toCard(rowRes.rows[0]) });
+  } catch (err) {
     removePhoto(newPhoto);
-    return res.status(400).json({ error: 'data ফিল্ডের JSON সঠিক নয়।' });
+    console.error('Card update error:', err);
+    res.status(500).json({ error: 'কার্ড আপডেট করতে সমস্যা হয়েছে।' });
   }
-
-  const { errors, value: v } = validate(body);
-  if (errors.length) {
-    removePhoto(newPhoto);
-    return res.status(400).json({ error: 'তথ্য সঠিক নয়', details: errors });
-  }
-
-  const clash = db.prepare('SELECT unique_code FROM cards WHERE nid = ? AND id != ?').get(v.nid, existing.id);
-  if (clash) {
-    removePhoto(newPhoto);
-    return res.status(409).json({ error: 'এই এনআইডি অন্য কার্ডে ব্যবহার হয়েছে।', uniqueCode: clash.unique_code });
-  }
-
-  db.prepare(`
-    UPDATE cards SET
-      nid=@nid, name=@name, father_name=@fatherName, mother_name=@motherName, phone=@phone,
-      dob=@dob, age=@age, age_text=@ageText, gender=@gender, marital_status=@maritalStatus,
-      spouse_nid=@spouseNid, occupation=@occupation, social_status=@socialStatus,
-      area_type=@areaType, area_name=@areaName, ward=@ward,
-      village=@village, upazila=@upazila, district=@district, photo=@photo, updated_at=@updatedAt
-    WHERE id=@id
-  `).run({ ...v, photo: newPhoto || existing.photo, updatedAt: new Date().toISOString(), id: existing.id });
-
-  if (newPhoto && existing.photo) removePhoto(existing.photo);
-
-  const row = db.prepare('SELECT * FROM cards WHERE id = ?').get(existing.id);
-  res.json({ card: toCard(row) });
 });
 
-// DELETE /api/cards/:code — শুধু admin মুছতে পারবে
-router.delete('/:code', requireRole('admin'), (req, res) => {
-  const row = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(req.params.code);
-  if (!row) return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
+// DELETE /api/cards/:code
+router.delete('/:code', requireRole('admin'), async (req, res) => {
+  try {
+    const rowRes = await db.query('SELECT * FROM cards WHERE unique_code = $1', [req.params.code]);
+    if (rowRes.rows.length === 0) return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
 
-  db.prepare('DELETE FROM cards WHERE id = ?').run(row.id);
-  removePhoto(row.photo);
-  res.json({ ok: true });
+    const row = rowRes.rows[0];
+    await db.query('DELETE FROM cards WHERE id = $1', [row.id]);
+    removePhoto(row.photo);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Card delete error:', err);
+    res.status(500).json({ error: 'কার্ড মুছতে সমস্যা হয়েছে।' });
+  }
 });
 
 module.exports = router;
