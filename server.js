@@ -16,10 +16,8 @@ const verifyRouter = require('./verify');
 
 const app = express();
 
-// নগিনক্স/ক্লাউড প্রক্সির পেছনে থাকলে আসল আইপি পেতে লাগে (রেট লিমিটের জন্য)
-if (process.env.TRUST_PROXY && process.env.TRUST_PROXY !== '0') {
-  app.set('trust proxy', Number(process.env.TRUST_PROXY) || 1);
-}
+// রেন্ডার বা ক্লাউড প্রক্সির পেছনে রেট লিমিট সঠিকভাবে কাজ করার জন্য ট্রাস্ট প্রক্সি সেট করা হলো
+app.set('trust proxy', 1);
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
