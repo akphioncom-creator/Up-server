@@ -5,15 +5,14 @@ const { Pool } = require('pg');
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
-    rejectUnauthorized: false // ক্লাউড ডাটাবেজের সিকিউর কানেকশনের জন্য প্রয়োজন
+    rejectUnauthorized: false // ক্লাউড ডাটাবেজের সিকিউর কানেকশনের জন্য অত্যন্ত জরুরি
   }
 });
 
 // ডাটাবেজ টেবিলগুলো ইনিশিয়ালাইজ করার ফাংশন
 async function initDatabase() {
-  const client = await pool.connect();
   try {
-    await client.query(`
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id            SERIAL PRIMARY KEY,
         username      TEXT NOT NULL UNIQUE,
@@ -63,11 +62,13 @@ async function initDatabase() {
     console.log('Supabase PostgreSQL database tables initialized successfully!');
   } catch (err) {
     console.error('Error initializing database tables:', err);
-  } finally {
-    client.release();
   }
 }
 
 initDatabase();
 
-module.exports = pool;
+// মডিউল হিসেবে query এবং pool এক্সপোর্ট করা হলো যাতে সব ফাইল থেকে সহজে ব্যবহার করা যায়
+module.exports = {
+  query: (text, params) => pool.query(text, params),
+  pool,
+};
