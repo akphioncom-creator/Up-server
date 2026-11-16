@@ -184,6 +184,60 @@ router.post('/face/check', upload.single('image'), async (req, res) => {
   }
 });
 
+// POST /api/cards/face/search — ছবির মুখ সার্ভারে সংরক্ষিত সব কার্ডের মুখের ভেক্টরের সাথে মেলানো (কিউআর স্ক্যানারের "ফেস" অপশন)
+// ফর্মের ফাইল-ঘর: image। ছবি সংরক্ষণ হয় না। কার্ডের কোনো তথ্যও বদলায় না (শুধু খোঁজা হয়)।
+// ফেরত: { valid:false, found:false, message } (মুখ স্পষ্ট না হলে)
+//        { valid:true, found:true, card, distance, threshold, checked } (মিলেছে)
+//        { valid:true, found:false, distance, threshold, checked } (সার্ভারে এই মুখের কেউ নেই)
+router.post('/face/search', upload.single('image'), async (req, res) => {
+  try {
+    const image = readUploadedImage(req);
+    if (!image) return res.status(400).json({ error: 'ছবি পাঠানো হয়নি।' });
+
+    const result = await face.extractFace(image);
+    if (!result.valid) {
+      return res.json({ valid: false, found: false, message: result.message });
+    }
+
+    // শুধু বর্তমান মডেলে বানানো ভেক্টরগুলোর সাথে মেলানো হয় (পুরোনো মডেলের ভেক্টরের সাথে তুলনা অর্থহীন)
+    const rows = db
+      .prepare('SELECT unique_code, face_vector FROM cards WHERE face_vector IS NOT NULL AND face_model = ?')
+      .all(face.MODEL_NAME);
+
+    let bestCode = null;
+    let bestDistance = Infinity;
+    for (const row of rows) {
+      let d;
+      try {
+        d = face.distance(face.fromBlob(row.face_vector), result.descriptor);
+      } catch (e) {
+        continue; // নষ্ট বা মাপ-না-মেলা ভেক্টর বাদ
+      }
+      if (d < bestDistance) {
+        bestDistance = d;
+        bestCode = row.unique_code;
+      }
+    }
+
+    const threshold = face.MATCH_DISTANCE;
+    const distance = bestCode ? Math.round(bestDistance * 1000) / 1000 : null; // যত কম তত বেশি মিল
+    const base = { valid: true, checked: rows.length, threshold };
+
+    if (!bestCode || bestDistance >= threshold) {
+      return res.json({ ...base, found: false, distance });
+    }
+
+    const cardRow = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(bestCode);
+    if (!cardRow) return res.json({ ...base, found: false, distance });
+
+    res.json({ ...base, found: true, distance, card: toCard(cardRow) });
+  } catch (err) {
+    sendFaceError(res, err);
+  } finally {
+    discardUpload(req);
+  }
+});
+
 // POST /api/cards — নতুন কার্ড (JSON অথবা multipart: photo + data)
 // ছবি (photo) এলে তা থেকে মুখের ভেক্টর বানিয়ে কার্ডের তথ্যের সাথে একই সারিতে, একই সময়ে সংরক্ষণ হয়।
 // ছবিতে ঠিক একটি স্পষ্ট মুখ না থাকলে কার্ডই তৈরি হয় না। ছবি নিজে রাখা হয় না, শুধু ভেক্টর থাকে।
