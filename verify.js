@@ -25,46 +25,62 @@ const isCode = (code) => /^\d{12,13}$/.test(code);
 const maskNid = (nid) => (nid.length > 3 ? '*'.repeat(nid.length - 3) + nid.slice(-3) : '***');
 
 // GET /api/verify/:code
-router.get('/:code', (req, res) => {
-  const { code } = req.params;
-  if (!isCode(code)) {
-    return res.status(400).json({ valid: false, error: 'কোড সঠিক নয়।' });
+router.get('/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    if (!isCode(code)) {
+      return res.status(400).json({ valid: false, error: 'কোড সঠিক নয়।' });
+    }
+
+    // PostgreSQL: $1 প্লেসহোল্ডার, async/await
+    const result = await db.query('SELECT * FROM cards WHERE unique_code = $1', [code]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ valid: false, error: 'এই কোডের কোনো কার্ড পাওয়া যায়নি।' });
+    }
+
+    const row = result.rows[0];
+    const showPhoto = process.env.VERIFY_SHOW_PHOTO === 'true' && row.photo;
+
+    res.json({
+      valid: true,
+      card: {
+        uniqueCode: row.unique_code,
+        name: row.name,
+        nid: maskNid(row.nid),
+        gender: row.gender,
+        ward: row.ward,
+        village: row.village,
+        upazila: row.upazila,
+        district: row.district,
+        socialStatus: row.social_status,
+        createdAt: row.created_at,
+        photoUrl: showPhoto ? `/api/verify/${row.unique_code}/photo` : '',
+      },
+    });
+  } catch (err) {
+    console.error('verify error:', err);
+    res.status(500).json({ valid: false, error: 'যাচাই করা যায়নি।' });
   }
-
-  const row = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(code);
-  if (!row) {
-    return res.status(404).json({ valid: false, error: 'এই কোডের কোনো কার্ড পাওয়া যায়নি।' });
-  }
-
-  const showPhoto = process.env.VERIFY_SHOW_PHOTO === 'true' && row.photo;
-
-  res.json({
-    valid: true,
-    card: {
-      uniqueCode: row.unique_code,
-      name: row.name,
-      nid: maskNid(row.nid),
-      gender: row.gender,
-      ward: row.ward,
-      village: row.village,
-      upazila: row.upazila,
-      district: row.district,
-      socialStatus: row.social_status,
-      createdAt: row.created_at,
-      photoUrl: showPhoto ? `/api/verify/${row.unique_code}/photo` : '',
-    },
-  });
 });
 
 // GET /api/verify/:code/photo — .env এ VERIFY_SHOW_PHOTO=true থাকলে তবেই কাজ করবে
-router.get('/:code/photo', (req, res) => {
-  const { code } = req.params;
-  if (process.env.VERIFY_SHOW_PHOTO !== 'true' || !isCode(code)) {
-    return res.status(404).json({ error: 'পাওয়া যায়নি।' });
+router.get('/:code/photo', async (req, res) => {
+  try {
+    const { code } = req.params;
+    if (process.env.VERIFY_SHOW_PHOTO !== 'true' || !isCode(code)) {
+      return res.status(404).json({ error: 'পাওয়া যায়নি।' });
+    }
+
+    const result = await db.query('SELECT photo FROM cards WHERE unique_code = $1', [code]);
+    if (result.rows.length === 0 || !result.rows[0].photo) {
+      return res.status(404).json({ error: 'পাওয়া যায়নি।' });
+    }
+
+    res.sendFile(path.join(UPLOAD_DIR, path.basename(result.rows[0].photo)));
+  } catch (err) {
+    console.error('verify photo error:', err);
+    res.status(500).json({ error: 'ছবি আনা যায়নি।' });
   }
-  const row = db.prepare('SELECT photo FROM cards WHERE unique_code = ?').get(code);
-  if (!row || !row.photo) return res.status(404).json({ error: 'পাওয়া যায়নি।' });
-  res.sendFile(path.join(UPLOAD_DIR, path.basename(row.photo)));
 });
 
 module.exports = router;
