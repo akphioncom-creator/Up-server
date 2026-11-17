@@ -13,30 +13,24 @@ if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
 const { router: authRouter, requireAuth } = require('./auth');
 const cardsRouter = require('./cards');
 const verifyRouter = require('./verify');
-const face = require('./face'); // মুখের ভেক্টর (Node.js এ, Python লাগে না)
 
 const app = express();
-
-// রেন্ডার বা ক্লাউড প্রক্সির পেছনে রেট লিমিট সঠিকভাবে কাজ করার জন্য ট্রাস্ট প্রক্সি সেট করা হলো
 app.set('trust proxy', 1);
-
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
-// মোবাইল অ্যাপের জন্য CORS লাগে না; শুধু ওয়েব থেকে ডাকলে CORS_ORIGIN দিন
 const origins = (process.env.CORS_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean);
 if (origins.length) app.use(cors({ origin: origins }));
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' })); // ভেক্টর ডেটার জন্য লিমিট বাড়ানো হলো
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-app.use('/api/auth', authRouter);          // লগইন
-app.use('/api/verify', verifyRouter);      // কিউআর যাচাই (লগইন ছাড়া, সীমিত তথ্য)
-app.use('/api/cards', requireAuth, cardsRouter); // কার্ডের তথ্য, মুখের ভেক্টর ও প্রতিটি কার্ডের ইতিহাস (লগইন লাগবে)
+app.use('/api/auth', authRouter);
+app.use('/api/verify', verifyRouter);
+app.use('/api/cards', requireAuth, cardsRouter);
 
 app.use((req, res) => res.status(404).json({ error: 'এই ঠিকানা পাওয়া যায়নি।' }));
 
-// সব ত্রুটি এক জায়গায় (ছবি আপলোডের ত্রুটিসহ)
 app.use((err, req, res, next) => {
   if (err && err.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({ error: 'ছবি ৩ এমবির বেশি হওয়া যাবে না।' });
@@ -54,9 +48,4 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`সার্ভার চালু আছে: http://localhost:${PORT}`);
-
-  // মুখের মডেল আগেভাগে লোড (সার্ভার চালুর পর, ব্যাকগ্রাউন্ডে); ব্যর্থ হলেও সার্ভার চলবে, প্রথম ছবির সময় আবার চেষ্টা হবে
-  face.warmUp()
-    .then(() => console.log('মুখের মডেল লোড হয়েছে।'))
-    .catch(() => console.warn('মুখের মডেল লোড করা যায়নি (npm install @vladmandic/face-api @tensorflow/tfjs-node চালিয়েছেন?)।'));
 });
