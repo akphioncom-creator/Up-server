@@ -1,24 +1,32 @@
-// মুখের ছবি থেকে ভেক্টর বানানো ও মেলানো — সম্পূর্ণ Node.js এ, face_service.py (Python) লাগে না।
+// মুখের ভেক্টর — Python face_service (face_recognition) কে HTTP দিয়ে কল করে।
+// Node সার্ভার নিজে মডেল চালায় না, তাই @vladmandic/face-api বা @tensorflow/tfjs-node লাগে না।
 //
-// ইনস্টল (server ফোল্ডারে):
-//   npm install @vladmandic/face-api @tensorflow/tfjs-node
+// cards.js এর ব্যবহার করা ইন্টারফেস একই থাকে:
+//   extractFace(buf) -> { valid, message, descriptor? (Float32Array, 128) }
+//   toBlob(desc), fromBlob(buf), distance(a,b), warmUp()
 //
-// মডেলের ফাইল @vladmandic/face-api প্যাকেজের ভেতরেই আছে, আলাদা করে নামাতে হয় না।
-// এটি cards.js এর ব্যবহার করা ইন্টারফেসই দেয়: extractFace, toBlob, fromBlob, distance, MATCH_DISTANCE, MODEL_NAME
-//
-// ভেক্টর: ১২৮ সংখ্যা (dlib-ধাঁচের ResNet), মাপ: ইউক্লিডিয়ান দূরত্ব (যত কম তত বেশি মিল)।
+// .env এ লাগবে:
+//   FACE_SERVICE_URL=http://localhost:8001
+//   FACE_API_KEY=একটি-লম্বা-গোপন-কী
+//   (ঐচ্ছিক) FACE_MATCH_DISTANCE=0.5  // এর কম হলে "একই ব্যক্তি"
 
-const path = require('path');
+const MODEL_NAME = 'face-recognition-128-v1';
+const MATCH_DISTANCE = Number(process.env.FACE_MATCH_DISTANCE || 0.5);
 
-const MODEL_NAME = 'face-api-128-v1'; // মডেল বদলালে এই নামও বদলান, cards.js তখন পুরোনো ভেক্টর ধরে ফেলবে
-const MATCH_DISTANCE = Number(process.env.FACE_MATCH_DISTANCE || 0.5); // এর কম হলে "একই ব্যক্তি" (face-api এর ডিফল্ট ০.৬, পরিচয়ের কাজে ০.৫ নিরাপদ)
-const MIN_DET_SCORE = 0.6; // মুখ শনাক্তের সর্বনিম্ন নিশ্চয়তা
-const MIN_FACE_SIZE = 80; // মুখের বক্সের সর্বনিম্ন পিক্সেল (ছোট দিক)
-const MAX_SIDE = 1280; // এর চেয়ে বড় ছবি ছোট করে নেওয়া হয় (মেমরি বাঁচাতে)
+// Python সার্ভিসের ভেক্টর সংখ্যা (face_recognition = 128)
+const DESCRIPTOR_DIM = 128;
 
-let tf = null;
-let faceapi = null;
-let loading = null;
+// সার্ভিসের ঠিকানা ও কী
+const SERVICE_URL = (process.env.FACE_SERVICE_URL || '').replace(/\/+$/, '');
+const API_KEY = process.env.FACE_API_KEY || '';
+
+// face_service.py এর /face/check এর বিকল্প: আমরা extractFace দিয়ে embedding নিই,
+// তারপর দরকার হলে check আলাদা করে করি। এখানে embedding endpoint ব্যবহার করছি।
+const EMBEDDING_PATH = '/face/embedding';
+const HEALTH_PATH = '/health';
+
+// সময়সীমা (দীর্ঘ ছবি/ধীর সার্ভারের জন্য)
+const TIMEOUT_MS = 30000;
 
 function codedError(code, message, cause) {
   const err = new Error(message);
@@ -27,94 +35,88 @@ function codedError(code, message, cause) {
   return err;
 }
 
-// মডেল একবারই লোড হয় (প্রথম অনুরোধে)
-function loadEngine() {
-  if (!loading) {
-    loading = (async () => {
-      try {
-        tf = require('@tensorflow/tfjs-node');
-        faceapi = require('@vladmandic/face-api');
-        const modelDir =
-          process.env.FACE_MODEL_DIR ||
-          path.join(path.dirname(require.resolve('@vladmandic/face-api')), '..', 'model');
-        await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelDir);
-        await faceapi.nets.faceLandmark68Net.loadFromDisk(modelDir);
-        await faceapi.nets.faceRecognitionNet.loadFromDisk(modelDir);
-      } catch (e) {
-        loading = null; // পরের অনুরোধে আবার চেষ্টা হবে
-        console.error('Face engine load error:', e);
-        throw codedError('FACE_ENGINE_UNAVAILABLE', 'Face engine unavailable', e);
-      }
-    })();
+// সার্ভিস ব্যবহারযোগ্য কিনা আগেভাগে যাচাই (warmUp)
+async function checkService() {
+  if (!SERVICE_URL || !API_KEY) {
+    throw codedError('FACE_ENGINE_UNAVAILABLE', 'FACE_SERVICE_URL বা FACE_API_KEY সেট করা নেই');
   }
-  return loading;
-}
-
-function decode(buffer) {
   try {
-    let img = tf.node.decodeImage(buffer, 3, 'int32', false); // JPG / PNG / BMP
-    const [h, w] = img.shape;
-    const big = Math.max(h, w);
-    if (big > MAX_SIDE) {
-      const k = MAX_SIDE / big;
-      const small = tf.tidy(() =>
-        tf.image.resizeBilinear(img, [Math.round(h * k), Math.round(w * k)]).cast('int32')
-      );
-      img.dispose();
-      img = small;
-    }
-    return img;
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+    const res = await fetch(SERVICE_URL + HEALTH_PATH, { signal: ctrl.signal });
+    clearTimeout(t);
+    if (!res.ok) throw new Error(`health ${res.status}`);
+    return true;
   } catch (e) {
-    throw codedError('UNSUPPORTED_IMAGE', 'Unsupported image', e);
+    throw codedError('FACE_ENGINE_UNAVAILABLE', 'Face service available নয়', e);
   }
 }
 
-// ছবিতে ঠিক একটি স্পষ্ট মুখ আছে কিনা দেখে; থাকলে তার ভেক্টর দেয়।
-// ফেরত: { valid, message, descriptor? (Float32Array, ১২৮) }
+// ছবির বাফার Python সার্ভিসে পাঠিয়ে ভেক্টর নেওয়া
+// ফেরত: { valid, message, descriptor?: Float32Array }
 async function extractFace(imageBuffer) {
-  await loadEngine();
-  const input = decode(imageBuffer);
-
-  try {
-    const results = await faceapi
-      .detectAllFaces(input, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5, maxResults: 5 }))
-      .withFaceLandmarks()
-      .withFaceDescriptors();
-
-    if (results.length === 0) {
-      return { valid: false, message: 'ছবিতে কোনো মুখ পাওয়া যায়নি, আবার তুলুন।' };
-    }
-    if (results.length > 1) {
-      return { valid: false, message: 'ছবিতে একাধিক মুখ আছে, শুধু একজনের ছবি দিন।' };
-    }
-
-    const { detection, descriptor } = results[0];
-    if (detection.score < MIN_DET_SCORE) {
-      return { valid: false, message: 'মুখ স্পষ্ট নয়, ভালো আলোয় সামনে থেকে তুলুন।' };
-    }
-    if (Math.min(detection.box.width, detection.box.height) < MIN_FACE_SIZE) {
-      return { valid: false, message: 'মুখ ছোট দেখাচ্ছে, ক্যামেরার আরেকটু কাছ থেকে তুলুন।' };
-    }
-
-    return { valid: true, message: '', descriptor };
-  } finally {
-    input.dispose();
+  if (!SERVICE_URL || !API_KEY) {
+    throw codedError('FACE_ENGINE_UNAVAILABLE', 'FACE_SERVICE_URL বা FACE_API_KEY সেট করা নেই');
   }
+
+  const form = new FormData();
+  form.append('image', new Blob([imageBuffer], { type: 'image/jpeg' }), 'face.jpg');
+
+  let res;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  try {
+    res = await fetch(SERVICE_URL + EMBEDDING_PATH, {
+      method: 'POST',
+      headers: { 'X-API-Key': API_KEY },
+      body: form,
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    throw codedError('FACE_ENGINE_UNAVAILABLE', 'Face service এ যোগাযোগ করা যায়নি', e);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let json = {};
+  try {
+    json = await res.json();
+  } catch (e) {
+    // JSON না হলে নিচে হ্যান্ডেল
+  }
+
+  if (res.status === 401) {
+    throw codedError('FACE_ENGINE_UNAVAILABLE', 'Face service API key ভুল', new Error('401'));
+  }
+  if (!res.ok) {
+    return { valid: false, message: json.detail || json.message || 'ছবি যাচাই করা যায়নি।' };
+  }
+
+  if (!json.valid) {
+    return { valid: false, message: json.message || 'ছবিতে ঠিক একটি স্পষ্ট মুখ পাওয়া যায়নি।' };
+  }
+
+  const arr = Array.isArray(json.embedding) ? json.embedding : [];
+  if (arr.length !== DESCRIPTOR_DIM) {
+    throw codedError('FACE_ENGINE_UNAVAILABLE', 'ভেক্টরের মাপ প্রত্যাশিত নয়', new Error(`dim=${arr.length}`));
+  }
+
+  return { valid: true, message: '', descriptor: Float32Array.from(arr) };
 }
 
-// ডেটাবেসে রাখার জন্য: Float32Array → Buffer (১২৮ × ৪ = ৫১২ বাইট)
+// ডেটাবেসে রাখার জন্য: Float32Array → Buffer (128 × 4 = 512 বাইট)
 function toBlob(descriptor) {
   const f32 = Float32Array.from(descriptor);
   return Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength);
 }
 
-// Buffer → Float32Array (কপি করে নেওয়া হয়, যাতে বাইট-সীমা নিয়ে সমস্যা না হয়)
+// Buffer → Float32Array (কপি করে নেওয়া হয়)
 function fromBlob(buf) {
-  const copy = Buffer.from(buf); // নতুন, আলাদা মেমরি
+  const copy = Buffer.from(buf);
   return new Float32Array(copy.buffer, copy.byteOffset, copy.byteLength / 4);
 }
 
-// দুটি ভেক্টরের ইউক্লিডিয়ান দূরত্ব
+// দুটি ভেক্টরের ইউক্লিডিয়ান দূরত্ব (face_recognition এর মতোই)
 function distance(a, b) {
   if (a.length !== b.length || a.length === 0) throw new Error('ভেক্টরের মাপ মেলেনি');
   let sum = 0;
@@ -125,9 +127,18 @@ function distance(a, b) {
   return Math.sqrt(sum);
 }
 
-// সার্ভার চালুর সময় মডেল আগেভাগে লোড করে রাখতে (প্রথম ছবির অপেক্ষা কমে)
+// সার্ভার চালুর সময় Python সার্ভিস আগেভাগে যাচাই
 function warmUp() {
-  return loadEngine();
+  return checkService();
 }
 
-module.exports = { extractFace, toBlob, fromBlob, distance, warmUp, MATCH_DISTANCE, MODEL_NAME };
+module.exports = {
+  extractFace,
+  toBlob,
+  fromBlob,
+  distance,
+  warmUp,
+  MATCH_DISTANCE,
+  MODEL_NAME,
+  DESCRIPTOR_DIM,
+};
