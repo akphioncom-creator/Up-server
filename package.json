@@ -1,18 +1,19 @@
 {
   "name": "smart-card-server",
   "version": "1.0.0",
-  "description": "Smart ID Card app backend (Express + SQLite)",
+  "description": "Smart ID Card app backend (Express + PostgreSQL + Python face_service)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "seed": "node seed.js"
+    "seed": "node seed.js",
+    "postinstall": "node scripts/install-python-deps.js",
+    "face-service": "python -m uvicorn face_service:app --host 0.0.0.0 --port 8001"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^11.3.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
