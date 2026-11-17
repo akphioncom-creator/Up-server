@@ -1,12 +1,13 @@
-// কার্ডের CRUD: তৈরি, তালিকা, একটি দেখা, বদলানো, মুছা, ছবি দেখা (সবই লগইন লাগে)
+// কার্ডের সব রুট: তৈরি, তালিকা, একটি দেখা, ছবি, বদলানো, মুছা,
+// মুখ যাচাই ও ভেক্টর (Python face_service), ফেস সার্চ, QR স্ক্যান, ইতিহাস, ইভেন্ট, restore।
 const express = require('express');
 const crypto = require('crypto');
 const path = require('path');
+const fs = require('fs');
 const db = require('./db');
 const { upload, removePhoto, UPLOAD_DIR } = require('./upload');
 const { requireRole } = require('./auth');
-const fs = require('fs');
-const face = require('./face'); // মুখের ছবি থেকে ভেক্টর বানানো ও মেলানো
+const face = require('./face');
 
 const router = express.Router();
 
@@ -18,11 +19,9 @@ const MARRIED = 'বিবাহিত';
 
 // ---------- সহায়ক ফাংশন ----------
 
-// বাংলা সংখ্যা → ইংরেজি সংখ্যা
 const toEnglishDigits = (text) =>
   String(text).replace(/[০-৯]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x09e6 + 48));
 
-// অ্যাপের মতোই জন্ম তারিখ যাচাই (DD/MM/YYYY; দিন/মাস অজানা হলে ০০)
 const isValidDob = (value) => {
   const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(value);
   if (!m) return false;
@@ -42,17 +41,15 @@ const isValidDob = (value) => {
   return d.getTime() <= now.getTime();
 };
 
-// ১২ ডিজিটের এমন কোড তৈরি যা আগে নেই (crypto দিয়ে, Math.random নয়)
-const codeExists = db.prepare('SELECT 1 FROM cards WHERE unique_code = ?');
-function generateUniqueCode() {
+async function generateUniqueCode() {
   for (let i = 0; i < 30; i++) {
     const code = String(crypto.randomInt(100000000000, 1000000000000));
-    if (!codeExists.get(code)) return code;
+    const found = await db.query('SELECT 1 FROM cards WHERE unique_code = $1', [code]);
+    if (found.rows.length === 0) return code;
   }
   throw new Error('ইউনিক কোড তৈরি করা যায়নি');
 }
 
-// ডাটাবেসের সারি → অ্যাপে পাঠানোর ফরম্যাট (camelCase)
 function toCard(row) {
   return {
     id: row.client_id || String(row.id),
@@ -70,18 +67,20 @@ function toCard(row) {
     spouseNid: row.spouse_nid,
     occupation: row.occupation,
     socialStatus: row.social_status,
+    areaType: row.area_type,
+    areaName: row.area_name,
     ward: row.ward,
     village: row.village,
     upazila: row.upazila,
     district: row.district,
     photoUrl: row.photo ? `/api/cards/${row.unique_code}/photo` : '',
-    hasFace: Boolean(row.face_vector), // মুখের ভেক্টর সংরক্ষিত আছে কিনা (ভেক্টর নিজে কখনো বাইরে যায় না)
+    hasFace: Boolean(row.face_vector),
+    scannedAt: row.scanned_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
-// অ্যাপ JSON পাঠাক বা multipart (ছবি + "data" ফিল্ডে JSON), দুটোই চলবে
 function readPayload(req) {
   if (req.body && typeof req.body.data === 'string') {
     return JSON.parse(req.body.data);
@@ -91,7 +90,6 @@ function readPayload(req) {
 
 const str = (v) => (v === undefined || v === null ? '' : String(v).trim());
 
-// ইনপুট যাচাই ও পরিষ্কার করা
 function validate(body) {
   const errors = [];
   const v = {
@@ -107,6 +105,8 @@ function validate(body) {
     spouseNid: toEnglishDigits(str(body.spouseNid)),
     occupation: str(body.occupation),
     socialStatus: str(body.socialStatus),
+    areaType: str(body.areaType),
+    areaName: str(body.areaName),
     ward: toEnglishDigits(str(body.ward)),
     village: str(body.village),
     upazila: str(body.upazila),
@@ -136,113 +136,45 @@ function validate(body) {
     v.spouseNid = '';
   }
 
-  // কার্ড তৈরির তারিখ: অ্যাপ ISO তারিখ দিলে সেটা, না দিলে সার্ভারের এখনকার সময়
   const parsed = v.createdAt ? new Date(v.createdAt) : null;
   v.createdAt = parsed && !isNaN(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
 
   return { errors, value: v };
 }
 
-// ---------- মুখের ভেক্টর: সহায়ক ----------
-
-// আপলোড করা ছবির বাইট পাওয়া (upload মেমরিতে রাখুক বা ডিস্কে, দুটোই চলে)
-function readUploadedImage(req) {
-  if (!req.file) return null;
-  return req.file.buffer || fs.readFileSync(req.file.path);
+async function buildFaceVector(photoName) {
+  if (!photoName) return null;
+  const filePath = path.join(UPLOAD_DIR, path.basename(photoName));
+  let buffer;
+  try {
+    buffer = await fs.promises.readFile(filePath);
+  } catch (e) {
+    return null;
+  }
+  const result = await face.extractFace(buffer);
+  if (!result.valid) {
+    return { valid: false, message: result.message || 'ছবিতে স্পষ্ট মুখ পাওয়া যায়নি।' };
+  }
+  return { valid: true, descriptor: result.descriptor };
 }
 
-// মুখ যাচাই/ভেক্টরের জন্য আসা ছবি সংরক্ষণ করা হয় না: কাজ শেষে ডিস্কে থাকলে মুছে ফেলা
-function discardUpload(req) {
-  if (req.file && req.file.filename) removePhoto(req.file.filename);
-}
-
-function sendFaceError(res, err) {
-  if (err && err.code === 'FACE_ENGINE_UNAVAILABLE') {
-    return res.status(503).json({ error: 'ছবি যাচাইয়ের ব্যবস্থা এখন চালু নেই।' });
+// ইভেন্ট সংরক্ষণ (হিস্ট্রি টেবিলে এক লাইন) — ব্যর্থ হলে চুপচাপ বাদ, কার্ডের কাজ আটকাবে না
+async function logCardEvent(cardId, uniqueCode, action, userId) {
+  try {
+    await db.query(
+      'INSERT INTO card_events (card_id, unique_code, action, user_id, created_at) VALUES ($1,$2,$3,$4,$5)',
+      [cardId, uniqueCode, action, userId || null, new Date().toISOString()]
+    );
+  } catch (e) {
+    console.warn('logCardEvent failed:', e.message);
   }
-  if (err && err.code === 'UNSUPPORTED_IMAGE') {
-    return res.status(415).json({ error: 'শুধু JPG বা PNG ছবি দেওয়া যাবে।' });
-  }
-  console.error('Face error:', err);
-  return res.status(500).json({ error: 'ছবি যাচাই করতে সমস্যা হয়েছে।' });
 }
 
 // ---------- রাউট ----------
 
-// POST /api/cards/face/check — ছবিতে ঠিক একটি স্পষ্ট মুখ আছে কিনা (কিছু সংরক্ষণ হয় না); ফর্মের ফাইল-ঘর: image
-router.post('/face/check', upload.single('image'), async (req, res) => {
-  try {
-    const image = readUploadedImage(req);
-    if (!image) return res.status(400).json({ error: 'ছবি পাঠানো হয়নি।' });
-
-    const result = await face.extractFace(image);
-    res.json({ valid: result.valid, message: result.message });
-  } catch (err) {
-    sendFaceError(res, err);
-  } finally {
-    discardUpload(req);
-  }
-});
-
-// POST /api/cards/face/search — ছবির মুখ সার্ভারে সংরক্ষিত সব কার্ডের মুখের ভেক্টরের সাথে মেলানো (কিউআর স্ক্যানারের "ফেস" অপশন)
-// ফর্মের ফাইল-ঘর: image। ছবি সংরক্ষণ হয় না। কার্ডের কোনো তথ্যও বদলায় না (শুধু খোঁজা হয়)।
-// ফেরত: { valid:false, found:false, message } (মুখ স্পষ্ট না হলে)
-//        { valid:true, found:true, card, distance, threshold, checked } (মিলেছে)
-//        { valid:true, found:false, distance, threshold, checked } (সার্ভারে এই মুখের কেউ নেই)
-router.post('/face/search', upload.single('image'), async (req, res) => {
-  try {
-    const image = readUploadedImage(req);
-    if (!image) return res.status(400).json({ error: 'ছবি পাঠানো হয়নি।' });
-
-    const result = await face.extractFace(image);
-    if (!result.valid) {
-      return res.json({ valid: false, found: false, message: result.message });
-    }
-
-    // শুধু বর্তমান মডেলে বানানো ভেক্টরগুলোর সাথে মেলানো হয় (পুরোনো মডেলের ভেক্টরের সাথে তুলনা অর্থহীন)
-    const rows = db
-      .prepare('SELECT unique_code, face_vector FROM cards WHERE face_vector IS NOT NULL AND face_model = ?')
-      .all(face.MODEL_NAME);
-
-    let bestCode = null;
-    let bestDistance = Infinity;
-    for (const row of rows) {
-      let d;
-      try {
-        d = face.distance(face.fromBlob(row.face_vector), result.descriptor);
-      } catch (e) {
-        continue; // নষ্ট বা মাপ-না-মেলা ভেক্টর বাদ
-      }
-      if (d < bestDistance) {
-        bestDistance = d;
-        bestCode = row.unique_code;
-      }
-    }
-
-    const threshold = face.MATCH_DISTANCE;
-    const distance = bestCode ? Math.round(bestDistance * 1000) / 1000 : null; // যত কম তত বেশি মিল
-    const base = { valid: true, checked: rows.length, threshold };
-
-    if (!bestCode || bestDistance >= threshold) {
-      return res.json({ ...base, found: false, distance });
-    }
-
-    const cardRow = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(bestCode);
-    if (!cardRow) return res.json({ ...base, found: false, distance });
-
-    res.json({ ...base, found: true, distance, card: toCard(cardRow) });
-  } catch (err) {
-    sendFaceError(res, err);
-  } finally {
-    discardUpload(req);
-  }
-});
-
 // POST /api/cards — নতুন কার্ড (JSON অথবা multipart: photo + data)
-// ছবি (photo) এলে তা থেকে মুখের ভেক্টর বানিয়ে কার্ডের তথ্যের সাথে একই সারিতে, একই সময়ে সংরক্ষণ হয়।
-// ছবিতে ঠিক একটি স্পষ্ট মুখ না থাকলে কার্ডই তৈরি হয় না। ছবি নিজে রাখা হয় না, শুধু ভেক্টর থাকে।
 router.post('/', upload.single('photo'), async (req, res) => {
-  let photoName = req.file ? req.file.filename : '';
+  const photoName = req.file ? req.file.filename : '';
 
   let body;
   try {
@@ -258,78 +190,67 @@ router.post('/', upload.single('photo'), async (req, res) => {
     return res.status(400).json({ error: 'তথ্য সঠিক নয়', details: errors });
   }
 
-  // একই ডেটা দুইবার পাঠালে (যেমন নেট কেটে গিয়ে আবার পাঠানো) নতুন কার্ড না বানিয়ে আগেরটাই ফেরত
-  if (v.clientId) {
-    const same = db.prepare('SELECT * FROM cards WHERE client_id = ?').get(v.clientId);
-    if (same) {
-      removePhoto(photoName);
-      return res.status(200).json({ card: toCard(same), duplicate: true });
-    }
-  }
-
-  // একই এনআইডি-র কার্ড আগেই থাকলে নতুন তৈরি হবে না
-  const nidRow = db.prepare('SELECT * FROM cards WHERE nid = ?').get(v.nid);
-  if (nidRow) {
-    removePhoto(photoName);
-    return res.status(409).json({
-      error: 'এই এনআইডি দিয়ে কার্ড আগেই তৈরি করা আছে।',
-      uniqueCode: nidRow.unique_code,
-    });
-  }
-
-  // ===== মুখের ভেক্টর: ছবি থেকে ভেক্টর বানানো (কার্ড সংরক্ষণের আগে) =====
-  let faceVector = null;
-  if (req.file) {
-    const image = readUploadedImage(req);
-    if (photoName) removePhoto(photoName); // ছবি রাখা হয় না; বাইট মেমরিতে নেওয়া হয়ে গেছে
-    photoName = '';
-
-    try {
-      const result = await face.extractFace(image);
-      if (!result.valid) {
-        return res.status(422).json({ error: result.message });
-      }
-      faceVector = face.toBlob(result.descriptor);
-    } catch (err) {
-      // ইঞ্জিন চালু না থাকলে: FACE_REQUIRED=1 থাকলে নিবন্ধন আটকাবে, নইলে ভেক্টর ছাড়াই কার্ড হবে
-      // (পরে POST /api/cards/:code/face দিয়ে ভেক্টর যোগ করা যায়)
-      if (err && err.code === 'FACE_ENGINE_UNAVAILABLE' && process.env.FACE_REQUIRED !== '1') {
-        console.warn('Face engine unavailable: card created without face vector');
-      } else {
-        return sendFaceError(res, err);
-      }
-    }
-  }
-
   try {
-    const code = generateUniqueCode();
+    if (v.clientId) {
+      const sameRes = await db.query('SELECT * FROM cards WHERE client_id = $1', [v.clientId]);
+      if (sameRes.rows.length > 0) {
+        removePhoto(photoName);
+        return res.status(200).json({ card: toCard(sameRes.rows[0]), duplicate: true });
+      }
+    }
+
+    const nidRes = await db.query('SELECT * FROM cards WHERE nid = $1', [v.nid]);
+    if (nidRes.rows.length > 0) {
+      removePhoto(photoName);
+      return res.status(409).json({
+        error: 'এই এনআইডি দিয়ে কার্ড আগেই তৈরি করা আছে।',
+        uniqueCode: nidRes.rows[0].unique_code,
+      });
+    }
+
+    let faceVectorBuffer = null;
+    if (photoName) {
+      let fv;
+      try {
+        fv = await buildFaceVector(photoName);
+      } catch (e) {
+        removePhoto(photoName);
+        console.error('Face extract error:', e);
+        return res.status(503).json({ error: 'মুখ শনাক্তকরণ সার্ভিস পাওয়া যাচ্ছে না। একটু পরে আবার চেষ্টা করুন।' });
+      }
+      if (!fv) {
+        removePhoto(photoName);
+        return res.status(400).json({ error: 'ছবির ফাইল পড়া যায়নি।' });
+      }
+      if (!fv.valid) {
+        removePhoto(photoName);
+        return res.status(400).json({ error: fv.message || 'ছবিতে স্পষ্ট মুখ পাওয়া যায়নি।' });
+      }
+      faceVectorBuffer = face.toBlob(fv.descriptor);
+    }
+
+    const code = await generateUniqueCode();
     const now = new Date().toISOString();
 
-    db.prepare(`
-      INSERT INTO cards (
+    const insertRes = await db.query(
+      `INSERT INTO cards (
         unique_code, client_id, nid, name, father_name, mother_name, phone, dob, age, age_text,
-        gender, marital_status, spouse_nid, occupation, social_status, ward, village, upazila,
-        district, photo, created_at, updated_at, created_by,
-        face_vector, face_model, face_updated_at
+        gender, marital_status, spouse_nid, occupation, social_status, area_type, area_name, ward,
+        village, upazila, district, photo, face_vector, created_at, updated_at, created_by
       ) VALUES (
-        @code, @clientId, @nid, @name, @fatherName, @motherName, @phone, @dob, @age, @ageText,
-        @gender, @maritalStatus, @spouseNid, @occupation, @socialStatus, @ward, @village, @upazila,
-        @district, @photo, @createdAt, @updatedAt, @createdBy,
-        @faceVector, @faceModel, @faceUpdatedAt
-      )
-    `).run({
-      ...v,
-      code,
-      photo: photoName,
-      updatedAt: now,
-      createdBy: req.user.id,
-      faceVector,
-      faceModel: faceVector ? face.MODEL_NAME : '',
-      faceUpdatedAt: faceVector ? now : null,
-    });
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+        $11,$12,$13,$14,$15,$16,$17,$18,
+        $19,$20,$21,$22,$23,$24,$25,$26
+      ) RETURNING *`,
+      [
+        code, v.clientId, v.nid, v.name, v.fatherName, v.motherName, v.phone, v.dob, v.age, v.ageText,
+        v.gender, v.maritalStatus, v.spouseNid, v.occupation, v.socialStatus, v.areaType, v.areaName, v.ward,
+        v.village, v.upazila, v.district, photoName, faceVectorBuffer, v.createdAt, now, req.user.id,
+      ]
+    );
 
-    const row = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(code);
-    res.status(201).json({ card: toCard(row) });
+    await logCardEvent(insertRes.rows[0].id, code, 'card_created', req.user.id);
+    res.status(201).json({ card: toCard(insertRes.rows[0]) });
   } catch (err) {
     removePhoto(photoName);
     console.error('Card insert error:', err);
@@ -337,150 +258,404 @@ router.post('/', upload.single('photo'), async (req, res) => {
   }
 });
 
-// GET /api/cards?page=1&limit=50&q=রহিম — তালিকা ও খোঁজা
-router.get('/', (req, res) => {
-  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
-  const q = str(req.query.q);
-
-  const where = q ? 'WHERE name LIKE @like OR nid LIKE @like OR phone LIKE @like OR unique_code LIKE @like' : '';
-  const params = q ? { like: `%${q}%` } : {};
-
-  const total = db.prepare(`SELECT COUNT(*) AS n FROM cards ${where}`).get(params).n;
-  const rows = db
-    .prepare(`SELECT * FROM cards ${where} ORDER BY created_at DESC LIMIT @limit OFFSET @offset`)
-    .all({ ...params, limit, offset: (page - 1) * limit });
-
-  res.json({ total, page, limit, items: rows.map(toCard) });
-});
-
-// GET /api/cards/:code — একটি কার্ড
-router.get('/:code', (req, res) => {
-  const row = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(req.params.code);
-  if (!row) return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
-  res.json({ card: toCard(row) });
-});
-
-// GET /api/cards/:code/photo — ছবি (লগইন করা ব্যবহারকারীর জন্য)
-router.get('/:code/photo', (req, res) => {
-  const row = db.prepare('SELECT photo FROM cards WHERE unique_code = ?').get(req.params.code);
-  if (!row || !row.photo) return res.status(404).json({ error: 'ছবি পাওয়া যায়নি।' });
-  res.sendFile(path.join(UPLOAD_DIR, path.basename(row.photo)));
-});
-
-// POST /api/cards/:code/face — ছবি থেকে ভেক্টর বানিয়ে এই কার্ডের সাথে সংরক্ষণ (আগের ভেক্টর থাকলে বদলে যায়)
-// ছবি নিজে সংরক্ষণ হয় না, শুধু ভেক্টর থাকে; ফর্মের ফাইল-ঘর: image
-router.post('/:code/face', upload.single('image'), async (req, res) => {
+// GET /api/cards?page=1&limit=50&q=... — তালিকা ও খোঁজা
+router.get('/', async (req, res) => {
   try {
-    const card = db.prepare('SELECT id FROM cards WHERE unique_code = ?').get(req.params.code);
-    if (!card) return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    const q = str(req.query.q);
 
-    const image = readUploadedImage(req);
-    if (!image) return res.status(400).json({ error: 'ছবি পাঠানো হয়নি।' });
+    const params = [];
+    let where = '';
+    if (q) {
+      where = 'WHERE name ILIKE $1 OR nid ILIKE $1 OR phone ILIKE $1 OR unique_code ILIKE $1';
+      params.push(`%${q}%`);
+    }
 
-    const result = await face.extractFace(image);
-    if (!result.valid) return res.status(422).json({ error: result.message });
+    const totalRes = await db.query(`SELECT COUNT(*)::int AS n FROM cards ${where}`, params);
+    const offset = (page - 1) * limit;
+    const limitIdx = params.length + 1;
+    const offsetIdx = params.length + 2;
+    const rowsRes = await db.query(
+      `SELECT * FROM cards ${where} ORDER BY created_at DESC LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      [...params, limit, offset]
+    );
 
-    db.prepare(
-      'UPDATE cards SET face_vector = @vector, face_model = @model, face_updated_at = @at WHERE id = @id'
-    ).run({
-      vector: face.toBlob(result.descriptor),
-      model: face.MODEL_NAME,
-      at: new Date().toISOString(),
-      id: card.id,
+    res.json({
+      total: totalRes.rows[0].n,
+      page,
+      limit,
+      items: rowsRes.rows.map(toCard),
     });
-
-    res.json({ ok: true });
   } catch (err) {
-    sendFaceError(res, err);
-  } finally {
-    discardUpload(req);
+    console.error('Card list error:', err);
+    res.status(500).json({ error: 'তালিকা আনা যায়নি।' });
   }
 });
 
-// POST /api/cards/:code/face/verify — নতুন ছবির মুখ এই কার্ডে সংরক্ষিত ভেক্টরের সাথে মেলে কিনা
-router.post('/:code/face/verify', upload.single('image'), async (req, res) => {
+// GET /api/cards/check-nid/:nid — এনআইডি সার্ভারে আছে কিনা
+router.get('/check-nid/:nid', async (req, res) => {
   try {
-    const row = db.prepare('SELECT face_vector, face_model FROM cards WHERE unique_code = ?').get(req.params.code);
-    if (!row) return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
-    if (!row.face_vector) return res.status(409).json({ error: 'এই কার্ডে মুখের ভেক্টর সংরক্ষিত নেই।' });
-    if (row.face_model !== face.MODEL_NAME) {
-      return res.status(409).json({ error: 'ভেক্টর পুরোনো মডেলে বানানো, আবার ছবি দিয়ে সংরক্ষণ করুন।' });
+    const nid = toEnglishDigits(str(req.params.nid));
+    if (!nid) return res.status(400).json({ error: 'এনআইডি দেওয়া হয়নি।' });
+    const r = await db.query('SELECT 1 FROM cards WHERE nid = $1', [nid]);
+    res.json({ exists: r.rows.length > 0 });
+  } catch (err) {
+    console.error('check-nid error:', err);
+    res.status(500).json({ error: 'এনআইডি যাচাই করা যায়নি।' });
+  }
+});
+
+// GET /api/cards/scans/summary — মোট ও স্ক্যান হওয়া
+router.get('/scans/summary', async (req, res) => {
+  try {
+    const totalRes = await db.query('SELECT COUNT(*)::int AS n FROM cards');
+    const scannedRes = await db.query('SELECT COUNT(*)::int AS n FROM cards WHERE scanned_at IS NOT NULL');
+    res.json({ total: totalRes.rows[0].n, scanned: scannedRes.rows[0].n });
+  } catch (err) {
+    console.error('scans summary error:', err);
+    res.status(500).json({ error: 'অগ্রগতি আনা যায়নি।' });
+  }
+});
+
+// POST /api/cards/scans/reset — সব স্ক্যান চিহ্ন মুছে ফেলা (admin)
+router.post('/scans/reset', requireRole('admin'), async (req, res) => {
+  try {
+    const r = await db.query('UPDATE cards SET scanned_at = NULL WHERE scanned_at IS NOT NULL');
+    res.json({ ok: true, cleared: r.rowCount });
+  } catch (err) {
+    console.error('scans reset error:', err);
+    res.status(500).json({ error: 'রিস্টার্ট করা যায়নি।' });
+  }
+});
+
+// POST /api/cards/face-check — ছবিতে মুখ আছে কিনা যাচাই (সংরক্ষণ করে না)
+router.post('/face-check', upload.single('photo'), async (req, res) => {
+  const photoName = req.file ? req.file.filename : '';
+  if (!photoName) return res.status(400).json({ error: 'ছবি দেওয়া হয়নি।' });
+
+  try {
+    const buf = await fs.promises.readFile(path.join(UPLOAD_DIR, path.basename(photoName)));
+    const result = await face.extractFace(buf);
+    if (!result.valid) {
+      return res.json({ valid: false, message: result.message || 'ছবিতে স্পষ্ট মুখ পাওয়া যায়নি।' });
+    }
+    return res.json({ valid: true, message: '' });
+  } catch (e) {
+    console.error('face-check error:', e);
+    return res.status(503).json({ error: 'মুখ শনাক্তকরণ সার্ভিস পাওয়া যাচ্ছে না।' });
+  } finally {
+    removePhoto(photoName);
+  }
+});
+
+// POST /api/cards/face-search — ছবি তুলে সার্ভারে খোঁজা (Python face_service)
+router.post('/face-search', upload.single('photo'), async (req, res) => {
+  const photoName = req.file ? req.file.filename : '';
+  if (!photoName) return res.status(400).json({ error: 'ছবি দেওয়া হয়নি।' });
+
+  let result;
+  try {
+    const buf = await fs.promises.readFile(path.join(UPLOAD_DIR, path.basename(photoName)));
+    result = await face.extractFace(buf);
+  } catch (e) {
+    console.error('Face search extract error:', e);
+    return res.status(503).json({ error: 'মুখ শনাক্তকরণ সার্ভিস পাওয়া যাচ্ছে না।' });
+  } finally {
+    removePhoto(photoName);
+  }
+
+  if (!result.valid) {
+    return res.status(400).json({ error: result.message || 'ছবিতে স্পষ্ট মুখ পাওয়া যায়নি।' });
+  }
+
+  try {
+    const rows = (await db.query('SELECT * FROM cards WHERE face_vector IS NOT NULL')).rows;
+    let best = null;
+    for (const row of rows) {
+      try {
+        const stored = face.fromBlob(row.face_vector);
+        const d = face.distance(result.descriptor, stored);
+        if (best === null || d < best.distance) {
+          best = { distance: d, row };
+        }
+      } catch (e) {
+        // বাদ
+      }
     }
 
-    const image = readUploadedImage(req);
-    if (!image) return res.status(400).json({ error: 'ছবি পাঠানো হয়নি।' });
+    if (!best || best.distance > face.MATCH_DISTANCE) {
+      return res.json({
+        match: false,
+        message: 'এই মুখের সাথে কোনো নিবন্ধিত কার্ডের মিল পাওয়া যায়নি।',
+      });
+    }
 
-    const result = await face.extractFace(image);
-    if (!result.valid) return res.json({ valid: false, match: false, message: result.message });
+    const alreadyScanned = Boolean(best.row.scanned_at);
+    const scannedAt = alreadyScanned ? best.row.scanned_at : new Date().toISOString();
 
-    const distance = face.distance(face.fromBlob(row.face_vector), result.descriptor);
+    if (!alreadyScanned) {
+      await db.query('UPDATE cards SET scanned_at = $1 WHERE id = $2', [scannedAt, best.row.id]);
+      await logCardEvent(best.row.id, best.row.unique_code, 'scan_face', req.user.id);
+    }
+
+    const fresh = (await db.query('SELECT * FROM cards WHERE id = $1', [best.row.id])).rows[0] || best.row;
     res.json({
-      valid: true,
-      match: distance < face.MATCH_DISTANCE,
-      distance: Math.round(distance * 1000) / 1000, // যত কম তত বেশি মিল
+      match: true,
+      status: alreadyScanned ? 'duplicate' : 'success',
+      card: { ...toCard(fresh), scannedAt },
+      distance: Number(best.distance.toFixed(4)),
       threshold: face.MATCH_DISTANCE,
     });
   } catch (err) {
-    sendFaceError(res, err);
-  } finally {
-    discardUpload(req);
+    console.error('face-search error:', err);
+    res.status(500).json({ error: 'ফেস সার্চ করা যায়নি।' });
   }
 });
 
-// PUT /api/cards/:code — তথ্য বদলানো (নতুন ছবি দিলে পুরনোটা মুছে যাবে; কোড বদলায় না)
-router.put('/:code', upload.single('photo'), (req, res) => {
+// GET /api/cards/:code — একটি কার্ড
+router.get('/:code', async (req, res) => {
+  try {
+    const r = await db.query('SELECT * FROM cards WHERE unique_code = $1', [req.params.code]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
+    res.json({ card: toCard(r.rows[0]) });
+  } catch (err) {
+    console.error('card get error:', err);
+    res.status(500).json({ error: 'কার্ড আনা যায়নি।' });
+  }
+});
+
+// GET /api/cards/:code/photo
+router.get('/:code/photo', async (req, res) => {
+  try {
+    const r = await db.query('SELECT photo FROM cards WHERE unique_code = $1', [req.params.code]);
+    if (r.rows.length === 0 || !r.rows[0].photo) {
+      return res.status(404).json({ error: 'ছবি পাওয়া যায়নি।' });
+    }
+    res.sendFile(path.join(UPLOAD_DIR, path.basename(r.rows[0].photo)));
+  } catch (err) {
+    console.error('card photo error:', err);
+    res.status(500).json({ error: 'ছবি আনা যায়নি।' });
+  }
+});
+
+// POST /api/cards/:code/face — নির্দিষ্ট কার্ডে ছবি দিয়ে ভেক্টর আপডেট
+router.post('/:code/face', upload.single('photo'), async (req, res) => {
+  const photoName = req.file ? req.file.filename : '';
+  if (!photoName) return res.status(400).json({ error: 'ছবি দেওয়া হয়নি।' });
+
+  try {
+    const cardRes = await db.query('SELECT id FROM cards WHERE unique_code = $1', [req.params.code]);
+    if (cardRes.rows.length === 0) {
+      removePhoto(photoName);
+      return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
+    }
+
+    let fv;
+    try {
+      fv = await buildFaceVector(photoName);
+    } catch (e) {
+      removePhoto(photoName);
+      console.error('Face enroll error:', e);
+      return res.status(503).json({ error: 'মুখ শনাক্তকরণ সার্ভিস পাওয়া যাচ্ছে না।' });
+    }
+    if (!fv || !fv.valid) {
+      removePhoto(photoName);
+      return res.status(400).json({ error: (fv && fv.message) || 'ছবিতে স্পষ্ট মুখ পাওয়া যায়নি।' });
+    }
+
+    const blob = face.toBlob(fv.descriptor);
+    await db.query('UPDATE cards SET face_vector = $1, updated_at = $2 WHERE id = $3', [
+      blob, new Date().toISOString(), cardRes.rows[0].id,
+    ]);
+    await logCardEvent(cardRes.rows[0].id, req.params.code, 'face_updated', req.user.id);
+
+    removePhoto(photoName);
+    return res.json({ ok: true });
+  } catch (err) {
+    removePhoto(photoName);
+    console.error('face enroll db error:', err);
+    res.status(500).json({ error: 'ভেক্টর সংরক্ষণ করা যায়নি।' });
+  }
+});
+
+// POST /api/cards/:code/scan — QR স্ক্যান চিহ্ন (একবারই; পরে duplicate)
+router.post('/:code/scan', async (req, res) => {
+  try {
+    const r = await db.query('SELECT * FROM cards WHERE unique_code = $1', [req.params.code]);
+    if (r.rows.length === 0) {
+      return res.json({ status: 'notfound' });
+    }
+    const row = r.rows[0];
+
+    if (row.scanned_at) {
+      return res.json({
+        status: 'duplicate',
+        card: { ...toCard(row), scannedAt: row.scanned_at },
+      });
+    }
+
+    const scannedAt = new Date().toISOString();
+    await db.query('UPDATE cards SET scanned_at = $1 WHERE id = $2', [scannedAt, row.id]);
+    await logCardEvent(row.id, row.unique_code, 'scan_qr', req.user.id);
+
+    const fresh = (await db.query('SELECT * FROM cards WHERE id = $1', [row.id])).rows[0] || row;
+    return res.json({
+      status: 'success',
+      card: { ...toCard(fresh), scannedAt },
+    });
+  } catch (err) {
+    console.error('card scan error:', err);
+    res.status(500).json({ error: 'স্ক্যান করা যায়নি।' });
+  }
+});
+
+// GET /api/cards/:code/history — কার্ডের ইতিহাস (সর্বশেষ আগে)
+router.get('/:code/history', async (req, res) => {
+  try {
+    const r = await db.query(
+      'SELECT action, user_id, created_at FROM card_events WHERE unique_code = $1 ORDER BY created_at DESC LIMIT 200',
+      [req.params.code]
+    );
+    res.json({ items: r.rows });
+  } catch (err) {
+    console.error('card history error:', err);
+    res.status(500).json({ error: 'ইতিহাস আনা যায়নি।' });
+  }
+});
+
+// POST /api/cards/:code/events — { action: 'card_opened' | 'card_saved' | ... }
+router.post('/:code/events', async (req, res) => {
+  const { action } = req.body || {};
+  if (!action || typeof action !== 'string') {
+    return res.status(400).json({ error: 'action দেওয়া হয়নি।' });
+  }
+  try {
+    const r = await db.query('SELECT id FROM cards WHERE unique_code = $1', [req.params.code]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
+
+    await logCardEvent(r.rows[0].id, req.params.code, action, req.user.id);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('card event error:', err);
+    res.status(500).json({ error: 'ইভেন্ট সংরক্ষণ করা যায়নি।' });
+  }
+});
+
+// POST /api/cards/:code/restore — মুছে ফেলা কার্ড ফেরানো (admin)
+// ملاحظة: আপনার cards টেবিলে deleted_at কলাম নেই, তাই আপাতত কিছুই করার নেই — 200 ফেরত দিচ্ছি
+router.post('/:code/restore', requireRole('admin'), async (req, res) => {
+  try {
+    const r = await db.query('SELECT id FROM cards WHERE unique_code = $1', [req.params.code]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
+    res.json({ ok: true, restored: 0 });
+  } catch (err) {
+    console.error('card restore error:', err);
+    res.status(500).json({ error: 'ফেরানো যায়নি।' });
+  }
+});
+
+// PUT /api/cards/:code — তথ্য বদলানো (নতুন ছবি দিলে নতুন ভেক্টর)
+router.put('/:code', upload.single('photo'), async (req, res) => {
   const newPhoto = req.file ? req.file.filename : '';
 
-  const existing = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(req.params.code);
-  if (!existing) {
-    removePhoto(newPhoto);
-    return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
-  }
-
-  let body;
   try {
-    body = readPayload(req);
-  } catch (e) {
+    const existingRes = await db.query('SELECT * FROM cards WHERE unique_code = $1', [req.params.code]);
+    if (existingRes.rows.length === 0) {
+      removePhoto(newPhoto);
+      return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
+    }
+    const existing = existingRes.rows[0];
+
+    let body;
+    try {
+      body = readPayload(req);
+    } catch (e) {
+      removePhoto(newPhoto);
+      return res.status(400).json({ error: 'data ফিল্ডের JSON সঠিক নয়।' });
+    }
+
+    const { errors, value: v } = validate(body);
+    if (errors.length) {
+      removePhoto(newPhoto);
+      return res.status(400).json({ error: 'তথ্য সঠিক নয়', details: errors });
+    }
+
+    const clashRes = await db.query('SELECT unique_code FROM cards WHERE nid = $1 AND id != $2', [
+      v.nid, existing.id,
+    ]);
+    if (clashRes.rows.length > 0) {
+      removePhoto(newPhoto);
+      return res.status(409).json({
+        error: 'এই এনআইডি অন্য কার্ডে ব্যবহার হয়েছে।',
+        uniqueCode: clashRes.rows[0].unique_code,
+      });
+    }
+
+    let faceVectorBuffer = existing.face_vector || null;
+    if (newPhoto) {
+      let fv;
+      try {
+        fv = await buildFaceVector(newPhoto);
+      } catch (e) {
+        removePhoto(newPhoto);
+        console.error('Face extract error (PUT):', e);
+        return res.status(503).json({ error: 'মুখ শনাক্তকরণ সার্ভিস পাওয়া যাচ্ছে না।' });
+      }
+      if (!fv) {
+        removePhoto(newPhoto);
+        return res.status(400).json({ error: 'ছবির ফাইল পড়া যায়নি।' });
+      }
+      if (!fv.valid) {
+        removePhoto(newPhoto);
+        return res.status(400).json({ error: fv.message || 'ছবিতে স্পষ্ট মুখ পাওয়া যায়নি।' });
+      }
+      faceVectorBuffer = face.toBlob(fv.descriptor);
+    }
+
+    const updateRes = await db.query(
+      `UPDATE cards SET
+        nid=$1, name=$2, father_name=$3, mother_name=$4, phone=$5,
+        dob=$6, age=$7, age_text=$8, gender=$9, marital_status=$10,
+        spouse_nid=$11, occupation=$12, social_status=$13, area_type=$14, area_name=$15,
+        ward=$16, village=$17, upazila=$18, district=$19, photo=$20,
+        face_vector=$21, updated_at=$22
+      WHERE id=$23 RETURNING *`,
+      [
+        v.nid, v.name, v.fatherName, v.motherName, v.phone,
+        v.dob, v.age, v.ageText, v.gender, v.maritalStatus,
+        v.spouseNid, v.occupation, v.socialStatus, v.areaType, v.areaName,
+        v.ward, v.village, v.upazila, v.district, newPhoto || existing.photo,
+        faceVectorBuffer, new Date().toISOString(),
+        existing.id,
+      ]
+    );
+
+    if (newPhoto && existing.photo) removePhoto(existing.photo);
+    await logCardEvent(existing.id, existing.unique_code, 'card_updated', req.user.id);
+
+    res.json({ card: toCard(updateRes.rows[0]) });
+  } catch (err) {
     removePhoto(newPhoto);
-    return res.status(400).json({ error: 'data ফিল্ডের JSON সঠিক নয়।' });
+    console.error('Card update error:', err);
+    res.status(500).json({ error: 'কার্ড বদলানো যায়নি।' });
   }
-
-  const { errors, value: v } = validate(body);
-  if (errors.length) {
-    removePhoto(newPhoto);
-    return res.status(400).json({ error: 'তথ্য সঠিক নয়', details: errors });
-  }
-
-  const clash = db.prepare('SELECT unique_code FROM cards WHERE nid = ? AND id != ?').get(v.nid, existing.id);
-  if (clash) {
-    removePhoto(newPhoto);
-    return res.status(409).json({ error: 'এই এনআইডি অন্য কার্ডে ব্যবহার হয়েছে।', uniqueCode: clash.unique_code });
-  }
-
-  db.prepare(`
-    UPDATE cards SET
-      nid=@nid, name=@name, father_name=@fatherName, mother_name=@motherName, phone=@phone,
-      dob=@dob, age=@age, age_text=@ageText, gender=@gender, marital_status=@maritalStatus,
-      spouse_nid=@spouseNid, occupation=@occupation, social_status=@socialStatus, ward=@ward,
-      village=@village, upazila=@upazila, district=@district, photo=@photo, updated_at=@updatedAt
-    WHERE id=@id
-  `).run({ ...v, photo: newPhoto || existing.photo, updatedAt: new Date().toISOString(), id: existing.id });
-
-  if (newPhoto && existing.photo) removePhoto(existing.photo);
-
-  const row = db.prepare('SELECT * FROM cards WHERE id = ?').get(existing.id);
-  res.json({ card: toCard(row) });
 });
 
-// DELETE /api/cards/:code — শুধু admin মুছতে পারবে
-router.delete('/:code', requireRole('admin'), (req, res) => {
-  const row = db.prepare('SELECT * FROM cards WHERE unique_code = ?').get(req.params.code);
-  if (!row) return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
+// DELETE /api/cards/:code — শুধু admin
+router.delete('/:code', requireRole('admin'), async (req, res) => {
+  try {
+    const r = await db.query('SELECT * FROM cards WHERE unique_code = $1', [req.params.code]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'কার্ড পাওয়া যায়নি।' });
 
-  db.prepare('DELETE FROM cards WHERE id = ?').run(row.id);
-  removePhoto(row.photo);
-  res.json({ ok: true });
+    await logCardEvent(r.rows[0].id, r.rows[0].unique_code, 'card_deleted', req.user.id);
+    await db.query('DELETE FROM cards WHERE id = $1', [r.rows[0].id]);
+    removePhoto(r.rows[0].photo);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Card delete error:', err);
+    res.status(500).json({ error: 'কার্ড মোছা যায়নি।' });
+  }
 });
 
 module.exports = router;
