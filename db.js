@@ -9,7 +9,7 @@ const pool = new Pool({
   }
 });
 
-// ডাটাবেজ টেবিলগুলো ইনিশিয়ালাইজ করার ফাংশন
+// ডাটাবেজ টেবিলগুলো ইনিশিয়ালাইজ করার ফাংশন
 async function initDatabase() {
   try {
     await pool.query(`
@@ -46,6 +46,7 @@ async function initDatabase() {
         upazila        TEXT NOT NULL,
         district       TEXT NOT NULL,
         photo          TEXT NOT NULL DEFAULT '',
+        face_vector    BYTEA,
         created_at     TIMESTAMPTZ NOT NULL,
         updated_at     TIMESTAMPTZ NOT NULL,
         created_by     INTEGER REFERENCES users(id)
@@ -59,6 +60,12 @@ async function initDatabase() {
         value TEXT NOT NULL
       );
     `);
+
+    // পুরোনো DB তে face_vector কলাম না থাকলে যোগ করা (ALTER TABLE)
+    await pool.query(`
+      ALTER TABLE cards ADD COLUMN IF NOT EXISTS face_vector BYTEA;
+    `);
+
     console.log('Supabase PostgreSQL database tables initialized successfully!');
   } catch (err) {
     console.error('Error initializing database tables:', err);
