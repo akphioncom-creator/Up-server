@@ -1,16 +1,33 @@
 // ডাটাবেস (Supabase PostgreSQL): ক্লাউড ডাটাবেজ কানেকশন ও টেবিল সেটআপ
 const { Pool } = require('pg');
 
+if (!process.env.DATABASE_URL) {
+  console.error('CRITICAL ERROR: DATABASE_URL environment variable is not set! Please set DATABASE_URL in Render Environment settings.');
+}
+
 // রেন্ডারের Environment Variable থেকে DATABASE_URL নিয়ে কানেক্ট করবে
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false // ক্লাউড ডাটাবেজের সিকিউর কানেকশনের জন্য অত্যন্ত জরুরি
-  }
+  ssl: process.env.DATABASE_URL
+    ? { rejectUnauthorized: false } // ক্লাউড ডাটাবেজের সিকিউর কানেকশনের জন্য অত্যন্ত জরুরি
+    : false,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+});
+
+// নিষ্ক্রিয় বা বিচ্ছিন্ন ক্লায়েন্টের কারণে আনহ্যান্ডেলড এরর থেকে সার্ভার ক্র্যাশ রোধ করবে
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle PostgreSQL client:', err);
 });
 
 // ডাটাবেজ টেবিলগুলো ইনিশিয়ালাইজ করার ফাংশন
 async function initDatabase() {
+  if (!process.env.DATABASE_URL) {
+    console.error('Skipping initDatabase because DATABASE_URL is missing.');
+    return;
+  }
+
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
