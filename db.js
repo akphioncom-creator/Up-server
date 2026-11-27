@@ -89,10 +89,11 @@ async function initDatabase() {
   }
 }
 
-initDatabase();
+const ready = initDatabase();
 
-// মডিউল হিসেবে query এবং pool এক্সপোর্ট করা হলো যাতে সব ফাইল থেকে সহজে ব্যবহার করা যায়
+// মডিউল হিসেবে query, pool এবং ready এক্সপোর্ট করা হলো যাতে সব ফাইল থেকে সহজে ব্যবহার করা যায়
 module.exports = {
   query: (text, params) => pool.query(text, params),
   pool,
+  ready,
 };
