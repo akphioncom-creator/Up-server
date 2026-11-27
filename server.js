@@ -1,52 +1,86 @@
-// মূল সার্ভার ফাইল: চালু করতে  npm start
-require('dotenv').config();
-
+// কার্ড যাচাই (লগইন ছাড়াই): কিউআর স্ক্যান করে পাওয়া কোড দিয়ে কার্ড আসল কিনা দেখা
+// গোপনীয়তার জন্য শুধু সীমিত তথ্য ফেরত যায় — এনআইডি আংশিক ঢাকা, ফোন নম্বর/বাবা-মায়ের নাম নেই
 const express = require('express');
-const helmet = require('helmet');
-const cors = require('cors');
+const path = require('path');
+const rateLimit = require('express-rate-limit');
+const db = require('./db');
+const { UPLOAD_DIR } = require('./upload');
 
-if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
-  console.error('ত্রুটি: .env ফাইলে কমপক্ষে ৩২ অক্ষরের JWT_SECRET দিন (.env.example দেখুন)।');
-  process.exit(1);
-}
+const router = express.Router();
 
-const { router: authRouter, requireAuth } = require('./auth');
-const cardsRouter = require('./cards');
-const verifyRouter = require('./verify');
-
-const app = express();
-const trustProxy = process.env.TRUST_PROXY !== undefined ? Number(process.env.TRUST_PROXY) : 1;
-app.set('trust proxy', Number.isNaN(trustProxy) ? 1 : trustProxy);
-app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
-
-const origins = (process.env.CORS_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean);
-if (origins.length) app.use(cors({ origin: origins }));
-
-app.use(express.json({ limit: '2mb' })); // ভেক্টর ডেটার জন্য লিমিট বাড়ানো হলো
-
-app.get('/api/health', (req, res) => res.json({ ok: true }));
-
-app.use('/api/auth', authRouter);
-app.use('/api/verify', verifyRouter);
-app.use('/api/cards', requireAuth, cardsRouter);
-
-app.use((req, res) => res.status(404).json({ error: 'এই ঠিকানা পাওয়া যায়নি।' }));
-
-app.use((err, req, res, next) => {
-  if (err && err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(413).json({ error: 'ছবি ৩ এমবির বেশি হওয়া যাবে না।' });
-  }
-  if (err && err.message === 'INVALID_IMAGE_TYPE') {
-    return res.status(415).json({ error: 'শুধু JPG, PNG বা WEBP ছবি দেওয়া যাবে।' });
-  }
-  if (err && err.type === 'entity.parse.failed') {
-    return res.status(400).json({ error: 'JSON সঠিক নয়।' });
-  }
-  console.error(err);
-  res.status(500).json({ error: 'সার্ভারে একটি সমস্যা হয়েছে।' });
+// একই আইপি থেকে বারবার কোড আন্দাজ করে খোঁজা ঠেকানো
+const verifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { valid: false, error: 'অনেকবার চেষ্টা হয়েছে, একটু পরে আবার চেষ্টা করুন।' },
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`সার্ভার চালু আছে: http://localhost:${PORT}`);
+router.use(verifyLimiter);
+
+const isCode = (code) => /^\d{12,13}$/.test(code);
+
+// এনআইডির শেষ ৩ ডিজিট ছাড়া বাকি সব ঢেকে দেওয়া
+const maskNid = (nid) => (nid.length > 3 ? '*'.repeat(nid.length - 3) + nid.slice(-3) : '***');
+
+// GET /api/verify/:code
+router.get('/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    if (!isCode(code)) {
+      return res.status(400).json({ valid: false, error: 'কোড সঠিক নয়।' });
+    }
+
+    // PostgreSQL: $1 প্লেসহোল্ডার, async/await
+    const result = await db.query('SELECT * FROM cards WHERE unique_code = $1', [code]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ valid: false, error: 'এই কোডের কোনো কার্ড পাওয়া যায়নি।' });
+    }
+
+    const row = result.rows[0];
+    const showPhoto = process.env.VERIFY_SHOW_PHOTO === 'true' && row.photo;
+
+    res.json({
+      valid: true,
+      card: {
+        uniqueCode: row.unique_code,
+        name: row.name,
+        nid: maskNid(row.nid),
+        gender: row.gender,
+        ward: row.ward,
+        village: row.village,
+        upazila: row.upazila,
+        district: row.district,
+        socialStatus: row.social_status,
+        createdAt: row.created_at,
+        photoUrl: showPhoto ? `/api/verify/${row.unique_code}/photo` : '',
+      },
+    });
+  } catch (err) {
+    console.error('verify error:', err);
+    res.status(500).json({ valid: false, error: 'যাচাই করা যায়নি।' });
+  }
 });
+
+// GET /api/verify/:code/photo — .env এ VERIFY_SHOW_PHOTO=true থাকলে তবেই কাজ করবে
+router.get('/:code/photo', async (req, res) => {
+  try {
+    const { code } = req.params;
+    if (process.env.VERIFY_SHOW_PHOTO !== 'true' || !isCode(code)) {
+      return res.status(404).json({ error: 'পাওয়া যায়নি।' });
+    }
+
+    const result = await db.query('SELECT photo FROM cards WHERE unique_code = $1', [code]);
+    if (result.rows.length === 0 || !result.rows[0].photo) {
+      return res.status(404).json({ error: 'পাওয়া যায়নি।' });
+    }
+
+    res.sendFile(path.join(UPLOAD_DIR, path.basename(result.rows[0].photo)));
+  } catch (err) {
+    console.error('verify photo error:', err);
+    res.status(500).json({ error: 'ছবি আনা যায়নি।' });
+  }
+});
+
+module.exports = router;
