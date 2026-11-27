@@ -11,12 +11,35 @@ const router = express.Router();
 const MARRIED = 'বিবাহিত';
 
 const str = (v) => (v === undefined || v === null ? '' : String(v).trim());
-const toEnglishDigits = (text) => String(text).replace(/[০-৯]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x09e6 + 48));
+const toEnglishDigits = (text) =>
+  String(text).replace(/[০-৯]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x09e6 + 48));
 
-// অ্যাপ থেকে পাঠানো ফেস ভেক্টর (JSON অ্যারে) কে Buffer এ রূপান্তর
+function normalizeFaceVector(rawVector) {
+  let vec = rawVector;
+  if (typeof vec === 'string') {
+    const trimmed = vec.trim();
+    if (!trimmed) return null;
+    try {
+      vec = JSON.parse(trimmed);
+    } catch (_) {
+      return null;
+    }
+  }
+  if (!Array.isArray(vec) || vec.length !== face.DESCRIPTOR_DIM) {
+    return null;
+  }
+  const nums = vec.map((n) => Number(n));
+  if (nums.some((n) => !Number.isFinite(n))) {
+    return null;
+  }
+  return nums;
+}
+
+// অ্যাপ থেকে পাঠানো ফেস ভেক্টর (JSON অ্যারে বা JSON স্ট্রিং) কে Buffer এ রূপান্তর
 function parseFaceVector(body) {
-  if (body.faceVector && Array.isArray(body.faceVector) && body.faceVector.length === 128) {
-    return face.toBlob(body.faceVector);
+  const normalized = normalizeFaceVector(body && body.faceVector);
+  if (normalized) {
+    return face.toBlob(normalized);
   }
   return null;
 }
@@ -38,22 +61,29 @@ function toCard(row) {
 // POST /api/cards — নতুন কার্ড
 router.post('/', upload.single('photo'), async (req, res) => {
   const photoName = req.file ? req.file.filename : '';
-  let body = req.body;
+  let body = req.body || {};
 
   try {
-    if (body.data) body = JSON.parse(body.data); // multipart হলে data ফিল্ডে JSON থাকে
+    if (body.data) {
+      body = typeof body.data === 'string' ? JSON.parse(body.data) : body.data;
+    }
 
     const faceVectorBuffer = parseFaceVector(body);
+    const cleanNid = toEnglishDigits(str(body.nid));
 
     // এনআইডি চেক
-    const nidRes = await db.query('SELECT unique_code FROM cards WHERE nid = $1', [toEnglishDigits(body.nid)]);
+    const nidRes = await db.query('SELECT unique_code FROM cards WHERE nid = $1', [cleanNid]);
     if (nidRes.rows.length > 0) {
       removePhoto(photoName);
-      return res.status(409).json({ error: 'এই এনআইডি দিয়ে কার্ড আগেই তৈরি করা আছে।', uniqueCode: nidRes.rows[0].unique_code });
+      return res.status(409).json({
+        error: 'এই এনআইডি দিয়ে কার্ড আগেই তৈরি করা আছে।',
+        uniqueCode: nidRes.rows[0].unique_code,
+      });
     }
 
     const code = String(crypto.randomInt(100000000000, 1000000000000));
     const now = new Date().toISOString();
+    const createdBy = req.user && Number.isInteger(req.user.id) && req.user.id > 0 ? req.user.id : null;
 
     const result = await db.query(
       `INSERT INTO cards (
@@ -62,10 +92,32 @@ router.post('/', upload.single('photo'), async (req, res) => {
         village, upazila, district, photo, face_vector, created_at, updated_at, created_by
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) RETURNING *`,
       [
-        code, body.clientId || null, toEnglishDigits(body.nid), body.name, body.fatherName, body.motherName, body.phone,
-        body.dob, body.age, body.ageText, body.gender, body.maritalStatus, body.spouseNid || '',
-        body.occupation, body.socialStatus, body.areaType || '', body.areaName || '', body.ward,
-        body.village, body.upazila, body.district, photoName, faceVectorBuffer, now, now, req.user.id
+        code,
+        body.clientId || null,
+        cleanNid,
+        str(body.name),
+        str(body.fatherName),
+        str(body.motherName),
+        str(body.phone),
+        str(body.dob),
+        body.age === '' || body.age === undefined || body.age === null ? null : Number(body.age),
+        str(body.ageText),
+        str(body.gender),
+        str(body.maritalStatus),
+        str(body.spouseNid),
+        str(body.occupation),
+        str(body.socialStatus),
+        str(body.areaType),
+        str(body.areaName),
+        str(body.ward),
+        str(body.village),
+        str(body.upazila),
+        str(body.district),
+        photoName,
+        faceVectorBuffer,
+        now,
+        now,
+        createdBy,
       ]
     );
 
@@ -80,8 +132,8 @@ router.post('/', upload.single('photo'), async (req, res) => {
 // POST /api/cards/face-search — অ্যাপ থেকে আসা ভেক্টর দিয়ে সার্চ
 router.post('/face-search', upload.none(), async (req, res) => {
   try {
-    const incomingVector = req.body.faceVector; // অ্যাপ থেকে আসা অ্যারে
-    if (!Array.isArray(incomingVector) || incomingVector.length !== 128) {
+    const incomingVector = normalizeFaceVector(req.body && req.body.faceVector);
+    if (!incomingVector) {
       return res.status(400).json({ error: 'ভেক্টর সঠিক নয়।' });
     }
 
@@ -109,7 +161,7 @@ router.post('/face-search', upload.none(), async (req, res) => {
       match: true,
       status: alreadyScanned ? 'duplicate' : 'success',
       card: toCard(best.row),
-      distance: best.distance
+      distance: best.distance,
     });
   } catch (err) {
     console.error(err);
