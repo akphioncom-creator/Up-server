@@ -15,7 +15,8 @@ const cardsRouter = require('./cards');
 const verifyRouter = require('./verify');
 
 const app = express();
-app.set('trust proxy', 1);
+const trustProxy = process.env.TRUST_PROXY !== undefined ? Number(process.env.TRUST_PROXY) : 1;
+app.set('trust proxy', Number.isNaN(trustProxy) ? 1 : trustProxy);
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
 const origins = (process.env.CORS_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean);
