@@ -17,31 +17,47 @@ const verifyLimiter = rateLimit({
   message: { valid: false, error: 'অনেকবার চেষ্টা হয়েছে, একটু পরে আবার চেষ্টা করুন।' },
 });
 
-router.use(verifyLimiter);
+const photoLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'অনেকবার চেষ্টা হয়েছে, একটু পরে আবার চেষ্টা করুন।' },
+});
 
-const isCode = (code) => /^\d{12,13}$/.test(code);
+const isCode = (code) => typeof code === 'string' && /^\d{12,13}$/.test(code);
 
 // এনআইডির শেষ ৩ ডিজিট ছাড়া বাকি সব ঢেকে দেওয়া
-const maskNid = (nid) => (nid.length > 3 ? '*'.repeat(nid.length - 3) + nid.slice(-3) : '***');
+const maskNid = (nid) => {
+  const value = String(nid || '').trim();
+  if (!value) return '***';
+  return value.length > 3 ? '*'.repeat(value.length - 3) + value.slice(-3) : '***';
+};
 
 // GET /api/verify/:code
-router.get('/:code', async (req, res) => {
+router.get('/:code', verifyLimiter, async (req, res) => {
   try {
     const { code } = req.params;
     if (!isCode(code)) {
       return res.status(400).json({ valid: false, error: 'কোড সঠিক নয়।' });
     }
 
-    // PostgreSQL: $1 প্লেসহোল্ডার, async/await
-    const result = await db.query('SELECT * FROM cards WHERE unique_code = $1', [code]);
+    const result = await db.query(
+      `SELECT unique_code, name, nid, gender, ward, village, upazila, district, social_status, created_at, photo
+       FROM cards
+       WHERE unique_code = $1
+       LIMIT 1`,
+      [code]
+    );
+
     if (result.rows.length === 0) {
       return res.status(404).json({ valid: false, error: 'এই কোডের কোনো কার্ড পাওয়া যায়নি।' });
     }
 
     const row = result.rows[0];
-    const showPhoto = process.env.VERIFY_SHOW_PHOTO === 'true' && row.photo;
+    const showPhoto = process.env.VERIFY_SHOW_PHOTO === 'true' && Boolean(row.photo);
 
-    res.json({
+    return res.json({
       valid: true,
       card: {
         uniqueCode: row.unique_code,
@@ -59,27 +75,44 @@ router.get('/:code', async (req, res) => {
     });
   } catch (err) {
     console.error('verify error:', err);
-    res.status(500).json({ valid: false, error: 'যাচাই করা যায়নি।' });
+    return res.status(500).json({ valid: false, error: 'যাচাই করা যায়নি।' });
   }
 });
 
 // GET /api/verify/:code/photo — .env এ VERIFY_SHOW_PHOTO=true থাকলে তবেই কাজ করবে
-router.get('/:code/photo', async (req, res) => {
+router.get('/:code/photo', photoLimiter, async (req, res) => {
   try {
     const { code } = req.params;
     if (process.env.VERIFY_SHOW_PHOTO !== 'true' || !isCode(code)) {
       return res.status(404).json({ error: 'পাওয়া যায়নি।' });
     }
 
-    const result = await db.query('SELECT photo FROM cards WHERE unique_code = $1', [code]);
+    const result = await db.query(
+      'SELECT photo FROM cards WHERE unique_code = $1 LIMIT 1',
+      [code]
+    );
+
     if (result.rows.length === 0 || !result.rows[0].photo) {
       return res.status(404).json({ error: 'পাওয়া যায়নি।' });
     }
 
-    res.sendFile(path.join(UPLOAD_DIR, path.basename(result.rows[0].photo)));
+    const safeFileName = path.basename(String(result.rows[0].photo));
+    const resolvedUploadDir = path.resolve(UPLOAD_DIR);
+    const fullPath = path.resolve(resolvedUploadDir, safeFileName);
+
+    if (!fullPath.startsWith(resolvedUploadDir + path.sep)) {
+      return res.status(400).json({ error: 'অবৈধ ফাইল পাথ।' });
+    }
+
+    return res.sendFile(fullPath, (sendErr) => {
+      if (sendErr && !res.headersSent) {
+        console.error('sendFile error:', sendErr);
+        res.status(404).json({ error: 'ছবি পাওয়া যায়নি।' });
+      }
+    });
   } catch (err) {
     console.error('verify photo error:', err);
-    res.status(500).json({ error: 'ছবি আনা যায়নি।' });
+    return res.status(500).json({ error: 'ছবি আনা যায়নি।' });
   }
 });
 
